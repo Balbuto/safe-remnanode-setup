@@ -175,10 +175,9 @@ safe-remnanode-setup/
 ├── safe-remnanode-setup.sh      # универсальный скрипт (всё в одном файле)
 ├── README.md                    # документация
 ├── USER_GUIDE.md                # подробное руководство пользователя
-├── PRODUCTION_READINESS_REPORT.md  # отчёт о готовности к production
-├── .github/workflows/ci.yml     # CI: shellcheck + bash -n + py_compile
-└── tests/check_embedded_python.py  # проверка встроенных Python-хелперов
+└── .github/workflows/ci.yml     # CI: shellcheck + bash -n + py_compile
 ```
+
 
 ## ⚠️ Примечания
 
