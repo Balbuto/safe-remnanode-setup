@@ -1,3 +1,6 @@
+<img width="1536" height="1024" alt="ChatGPT Image 10 авг  2026 г , 03_05_17" src="https://github.com/user-attachments/assets/faf25857-ea5b-44ac-b984-ed780ee3c632" />
+
+
 # 🛡️ Safe RemnaNode Setup v1.1.0
 
 **Универсальный интерактивный установщик ноды Remnawave** — один скрипт, который объединяет все возможности трёх проектов:
