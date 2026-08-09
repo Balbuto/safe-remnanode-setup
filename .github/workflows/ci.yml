@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: Lint & Syntax (shellcheck + bash -n + py_compile)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+
+      - name: bash -n (syntax check)
+        run: bash -n safe-remnanode-setup.sh
+
+      - name: ShellCheck
+        run: shellcheck safe-remnanode-setup.sh
+
+      - name: Embedded Python helpers (py_compile)
+        run: python3 tests/check_embedded_python.py
