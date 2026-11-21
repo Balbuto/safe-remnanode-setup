@@ -1,13 +1,13 @@
 <img width="1536" height="1024" alt="ChatGPT Image 10 авг  2026 г , 03_05_17" src="https://github.com/user-attachments/assets/faf25857-ea5b-44ac-b984-ed780ee3c632" />
 
 
-# 🛡️ Safe RemnaNode Setup v1.1.0
+# 🛡️ Safe RemnaNode Setup v1.1.0+hardening.13
 
-**Универсальный интерактивный установщик ноды Remnawave** — один скрипт, который объединяет все возможности трёх проектов:
+**Универсальный интерактивный установщик ноды Remnawave** — один скрипт, основанный на трёх проектах:
 
 | Проект | Что делает |
 |---|---|
-| [Balbuto/Setup-and-Test-Server-Ubuntu-24](https://github.com/Balbuto/Setup-and-Test-Server-Ubuntu-24) | Первоначальная настройка сервера: apt, базовый софт, Docker, BBR + Cake, sysctl SAFE/HIGHLOAD, IPv6, UFW-менеджер |
+| [Balbuto/Setup-and-Test-Server-Ubuntu-24](https://github.com/Balbuto/Setup-and-Test-Server-Ubuntu-24) | Первоначальная настройка сервера: apt, базовый софт, Docker, BBR + Cake, sysctl SAFE/HIGHLOAD, IPv6, просмотр статуса UFW |
 | [Balbuto/setup-remna-node](https://github.com/Balbuto/setup-remna-node) | Установка и управление нодой Remnawave: Xray-Core (VLESS Reality / TLS / xHTTP), SSL (Cloudflare / Gcore / Standalone), маскировка Selfsteal, UFW, логи |
 | [Balbuto/RKN-Watcher](https://github.com/Balbuto/RKN-Watcher) | Защита от сканеров РКН: блок-листы TSPUBLOCK/GOVIPS (iptables+ipset), GeoIP-фильтрация по странам, allow/deny IP и порты, systemd timer |
 
@@ -25,30 +25,33 @@
 
 ### Быстрый старт
 
-```bash
-# Скачать и запустить
-wget https://raw.githubusercontent.com/Balbuto/safe-remnanode-setup/main/safe-remnanode-setup.sh
-chmod +x safe-remnanode-setup.sh
-sudo ./safe-remnanode-setup.sh
+**Скачать и запустить исходную версию с GitHub.** Ветка `main` — версия оригинального репозитория; локальная ревизия `hardening.13` по этой ссылке не опубликована. Скачивайте в отдельный каталог, проверяйте файл перед запуском от root и не используйте `curl | bash`.
 
-# Или одной строкой (скрипт сам сохранит себя в /usr/local/bin)
-sudo bash -c "$(wget -qO- https://raw.githubusercontent.com/Balbuto/safe-remnanode-setup/main/safe-remnanode-setup.sh)"
+```bash
+wget -O safe-remnanode-setup.sh https://raw.githubusercontent.com/Balbuto/safe-remnanode-setup/main/safe-remnanode-setup.sh
 ```
 
-### Репозиторий
+После проверки скачанного файла:
 
 ```bash
-git clone https://github.com/Balbuto/safe-remnanode-setup.git
+chmod +x safe-remnanode-setup.sh
+sudo ./safe-remnanode-setup.sh
+```
+
+**Запустить `hardening.13` из ZIP.** Скопируйте `safe-remnanode-hardening.zip` на сервер и выполните:
+
+```bash
+unzip safe-remnanode-hardening.zip
 cd safe-remnanode-setup
-chmod +x safe-remnanode-setup.sh
-sudo ./safe-remnanode-setup.sh
+bash ./safe-remnanode-setup.sh --help
+sudo bash ./safe-remnanode-setup.sh node  # сразу запустить установку ноды
 ```
 
-После первого запуска регистрируются глобальные команды:
+Для открытия главного меню уберите `node`. Для обновления только команд на действующем сервере используйте `sudo bash ./safe-remnanode-setup.sh install-cli` вместо `node`.
 
-- `safe-remnanode-setup` — главное меню
-- `remnanode` — меню управления нодой (совместимость с setup-remna-node)
-- `rkn-watcher` — меню управления защитой (совместимость с RKN-Watcher)
+**Для установки ноды** нужен Docker Compose v2 с поддержкой `up --wait`. На чистом сервере установщик проверяет UFW: при необходимости ставит пакет, добавляет разрешение на фактический TCP-порт SSH и только затем включает firewall. Порт `22` не подставляется наугад. Уже активный UFW не перенастраивается на этом этапе, политика deny/reject для входящих соединений обязательна. Держите открытыми текущую SSH-сессию и консоль VPS, пока не проверите вход второй сессией.
+
+Перед обновлением действующего сервера прочитайте [заметки миграции](MIGRATION.md).
 
 ---
 
@@ -63,7 +66,7 @@ sudo ./safe-remnanode-setup.sh
  6. 🛡️  Управление защитой (блок-листы, GeoIP, настройки)
  7. 🧪 Диагностика и мульти-тесты сервера
  8. 🌐 Управление IPv6 (вкл/выкл + откат)
- 9. 🔥 UFW-менеджер (Balbuto/ufw-manager)
+ 9. 🔥 Статус UFW
  0. Выйти
 ```
 
@@ -80,25 +83,27 @@ sudo ./safe-remnanode-setup.sh
 - Профили ядра: **SAFE** / **HIGHLOAD** / **AUTO** (автовыбор по RAM) + лимиты `nofile`
 - `irqbalance`
 - Управление **IPv6** (отключение с restore-скриптом `/root/restore-ipv6.sh`)
-- **UFW-менеджер** (клон `Balbuto/ufw-manager` с проверкой diff)
-- Бэкапы всех изменяемых файлов в `/root/remna-universal-backups/`
+- **Просмотр статуса UFW** (без загрузки внешнего менеджера)
+- Бэкапы отдельных системных настроек в `/root/remna-universal-backups/`
 
 ## 🧩 Модуль B — Нода Remnawave
 
 Полный интерактивный флоу установки:
 
-1. Сетевая оптимизация (BBR + sysctl-профиль по RAM) + зависимости + Docker
-2. **Выбор версии Xray-Core** через GitHub API (встроенная / stable / pre-release, amd64 и arm64)
-3. Настройка логов на хост + **logrotate** (авторотация 50MB × 7)
+1. Зависимости и Docker; профиль sysctl — по явному запросу
+2. **Xray-Core**: при установке берётся текущий стабильный релиз GitHub (amd64/arm64), без замены на встроенную версию при ошибке
+3. Файловые журналы Xray и nginx на хосте, **logrotate**: ежедневно, порог 50 МБ при запуске планировщика, 7 архивов
 4. Ввод данных панели: IP панели, домен ноды, порт управления (по умолчанию 2222), **secret key** (вставка с двойным Enter)
-5. Дополнительные входящие порты Xray (автооткрытие в UFW)
-6. Выбор протокола: **VLESS Reality (Selfsteal)** / **VLESS+TLS** / **VLESS+TLS+xHTTP**
-7. **Маскировочный сайт**: шаблоны Mrvibecodic + мутатор `uniquify-theme` (случайный или конкретный из 8)
+5. Выбор конфигурации: **VLESS-Reality** (обязательный ввод SNI), **VLESS+TLS**, **VLESS+xHTTP+TLS** или **VLESS+TLS + VLESS+xHTTP+TLS + Hy2 одновременно**
+6. В совмещённом режиме вводятся фактические порты из панели: TCP для VLESS+TLS, TCP или UDP для xHTTP (HTTP/3), UDP для Hy2. Для остальных режимов доступен ввод дополнительных портов
+7. **Встроенный HTML-шаблонизатор**: три темы, ручной или случайный выбор, отдельный webroot `/opt/remnanode/www`; не скачивает и не исполняет сторонние скрипты
 8. **SSL**: Cloudflare API (wildcard DNS-01) / Certbot Standalone (HTTP-01) / Gcore DNS API + автопродление с deploy-hook
-9. Деплой `docker-compose`: `remnanode` + `remnawave-nginx` на host-сети с Unix-сокетом `/dev/shm/nginx.sock`
-10. **UFW**: default deny, автоопределение SSH-порта, 80/443, кастомные порты, порт управления открыт **только для IP панели**
+9. Деплой `docker-compose`: `remnanode` + `remnawave-nginx` (`nginx:1.31`) на host-сети с Unix-сокетом `/dev/shm/nginx.sock`
+10. **UFW**: добавление разрешений для IP панели и выбранных портов к уже настроенному firewall; правила администратора сохраняются.
 
-Меню управления нодой: смена домена и перевыпуск SSL, обновление Xray-Core, смена IP панели, управление портами (включая диапазоны), смена маскировочного шаблона, диагностика и логи в реальном времени, полное удаление с откатом.
+Меню управления нодой: смена домена и перевыпуск SSL, обновление Xray-Core, смена IP панели, управление портами (включая диапазоны), смена локального шаблона без перезапуска, диагностика и удаление файлов ноды без глобального сброса.
+
+Для трёх транспортов на одной ноде активируйте три inbound в **одном Config Profile** панели. Установщик не редактирует профиль. Для действующего деплоя используйте `node-transports` без пересоздания контейнеров; `node-check-ports` диагностирует слушатели. См. [порядок миграции](MIGRATION.md#три-транспорта-на-одной-ноде-10).
 
 ## 🧩 Модуль C — Защита RKN-Watcher
 
@@ -107,7 +112,7 @@ sudo ./safe-remnanode-setup.sh
 - Блокировка `iptables` + `ipset` (hash:net до 2 млн записей), **атомарное обновление** через временный set + swap
 - **GeoIP**: allow-страны (ipdeny с кэшем 24ч), allow/deny IP/CIDR, allow/deny порты, фильтрация по `FILTER_PORTS`
 - Логирование RST-пакетов (опционально)
-- **systemd timer** — ежедневное обновление в 03:00 + boot-сервис восстановления после перезагрузки
+- **systemd timer** — ежедневное обновление в 03:00 с задержкой до 20 минут + boot-сервис восстановления после перезагрузки
 - file-lock на JSON-конфигурацию (fcntl)
 - Манифест установленных пакетов — при удалении предлагается снять и их
 
@@ -115,12 +120,7 @@ Python-хелперы `config_tool.py` и `geoip_apply.py` **встроены в
 
 ## 🧩 Модуль D — Мульти-тесты
 
-Состав актуализирован по оригиналу [saveksme/multitest](https://github.com/saveksme/multitest) v1.1:
-
-IP Region, Censorcheck (геоблок/DPI), iPerf3 RU, **iPerf3 bench.tlab.pw (РФ)**, YABS, IP Check Place, IPQuality (`-l ru -I`), sysbench CPU/Memory, Network Bench, SSL/TLS check, traceroute/ping.
-
-- **Мультитест (99)**: `Enter` — запустить, `s` — пропустить, `q` — выйти, **Ctrl+C во время теста пропускает текущий**
-- Внешние скрипты запускаются **только по HTTPS** (верификация SHA256 отключена по требованию)
+Геолокация IP, sysbench CPU/Memory, загрузка тестового файла, проверка TLS, traceroute и ping. Внешние shell-скрипты убраны из меню. Мультитест `99` предлагает запустить каждый оставшийся тест по очереди.
 
 ---
 
@@ -128,11 +128,11 @@ IP Region, Censorcheck (геоблок/DPI), iPerf3 RU, **iPerf3 bench.tlab.pw (
 
 Один пункт меню (или `sudo safe-remnanode-setup express`) проводит полный цикл:
 
-1. **Сервер**: обновление → базовый софт → Docker → BBR+Cake → авто-hardening → irqbalance
+1. **Сервер**: проверка Compose и установка Docker при необходимости. Апгрейд ОС и сетевой профиль вынесены в отдельное меню.
 2. **Нода**: полный интерактивный флоу установки
-3. **Защита**: интерактивная установка RKN-Watcher
+3. **Защита**: установка RKN-Watcher только при подтверждении
 
-Если шаг не удался — экспресс не прерывается: скрипт предупредит и предложит повторить шаг позже.
+При ошибке обязательного шага экспресс-установка прекращается.
 
 ---
 
@@ -144,6 +144,8 @@ sudo safe-remnanode-setup express            # полная установка
 sudo safe-remnanode-setup server             # настройка сервера
 sudo safe-remnanode-setup node               # установка ноды
 sudo safe-remnanode-setup node-menu          # меню управления нодой
+sudo safe-remnanode-setup node-logs          # применить логи к существующей ноде
+# Необязательно: sudo safe-remnanode-setup node-logs example.com — путь TLS по зоне
 sudo safe-remnanode-setup protect            # установка защиты
 sudo safe-remnanode-setup protect-menu       # меню защиты
 sudo safe-remnanode-setup protect-update     # обновить блок-листы
@@ -160,13 +162,13 @@ sudo safe-remnanode-setup ipv6               # управление IPv6
 
 ## 🛡️ Безопасность
 
-- Только HTTPS при скачивании внешних скриптов
+- Скачанные сторонние shell-скрипты не исполняются автоматически
 - `set -Eeuo pipefail` + shellcheck чистый (0 замечаний)
-- Бэкапы изменяемых файлов перед правкой
-- Порт управления нодой открывается только для IP панели
-- UFW-правила добавляются недеструктивно
+- Compose проверяется перед заменой конфигов; при неудачном запуске скрипт пытается вернуть предыдущие файлы и применить их
+- Добавляется отдельное правило для IP панели. Уже открытые администратором или оставшиеся от предыдущих версий разрешения нужно проверить вручную.
+- При удалении ноды UFW не очищается: оставшиеся правила проверьте и снимите вручную.
 - Проверка поддержки ipset ядром перед установкой защиты
-- CI (GitHub Actions): shellcheck + bash -n + py_compile встроенных хелперов при каждом push/PR
+- CI (GitHub Actions): ShellCheck, bash -n, проверка Python-хелперов и `tests/smoke.sh` с заглушками при каждом push/PR
 
 ## 📁 Структура репозитория
 

@@ -21,23 +21,15 @@
 #   - Экспресс-режим: полная установка "сервер + нода + защита" за один запуск
 #   - Полностью русифицированный интерактивный интерфейс
 #   - Работает на Ubuntu 24.04 / Debian 11+ (root)
-#   - Безопасные загрузки: только HTTPS, опциональная проверка SHA256
+#   - Без автоматического исполнения загруженных shell-скриптов
 #   - Логирование всех действий + бэкапы изменяемых файлов
 #   - Регистрация глобальных команд: safe-remnanode-setup / remnanode / rkn-watcher
-#   - Автоперезапуск с реального терминала при запуске через curl | bash
+#   - Запуск установщика из локального файла
 # ==============================================================================
 
 set -Eeuo pipefail
 
-# --- ЖЁСТКАЯ ПРОВЕРКА ПРАВ ROOT (до инициализации всего остального) ---
-if [ "$EUID" -ne 0 ]; then
-    echo -e "\033[0;31m[✗] Ошибка: Скрипт должен быть запущен от имени root! Используйте: sudo $0\033[0m" >&2
-    exit 1
-fi
-
-# --- Ссылка на сырой код скрипта в репозитории (для удалённой регистрации) ---
-UNIVERSAL_SCRIPT_URL="https://raw.githubusercontent.com/Balbuto/safe-remnanode-setup/main/safe-remnanode-setup.sh"
-UNIVERSAL_VERSION="1.1.0"
+UNIVERSAL_VERSION="1.1.0+hardening.13"
 
 # --- Цвета ---
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -45,7 +37,7 @@ BLUE='\033[0;34m'; CYAN='\033[0;36m'; WHITE='\033[1;37m'; GRAY='\033[38;5;244m'
 MAGENTA='\033[0;35m'; NC='\033[0m'
 
 # --- Символы ---
-CHECK_MARK="✅"; CROSS_MARK="❌"; WARNING="⚠️"; INFO="ℹ️"
+CHECK_MARK="✅"; CROSS_MARK="❌"; WARNING="⚠️"
 INFO_T="[${BLUE}i${NC}]"; SUCCESS_T="[${GREEN}✓${NC}]"; WARNING_T="[${YELLOW}!${NC}]"; ERROR_T="[${RED}✗${NC}]"
 
 # ==============================================================================
@@ -66,13 +58,12 @@ log() {
 }
 
 init_logging() {
-    for path in "/var/log/remna-universal.log" "/tmp/remna-universal.log" "$HOME/remna-universal.log"; do
-        if touch "$path" 2>/dev/null; then
-            LOG_FILE="$path"
-            log "Лог: $LOG_FILE"
-            return 0
-        fi
-    done
+    local path=/var/log/remna-universal.log
+    if touch "$path" 2>/dev/null; then
+        LOG_FILE="$path"
+        log "Лог: $LOG_FILE"
+        return 0
+    fi
     LOG_FILE="/dev/null"
     echo -e "${WARNING} Логирование в файл отключено, использую /dev/null" >&2
 }
@@ -84,7 +75,7 @@ setup_general_logrotate() {
     cat > /etc/logrotate.d/remna-universal <<'EOF'
 /var/log/remna-universal.log {
     daily
-    size 50M
+    maxsize 50M
     rotate 7
     compress
     delaycompress
@@ -245,56 +236,6 @@ show_header() {
 }
 
 # ==============================================================================
-# БЕЗОПАСНАЯ ЗАГРУЗКА ВНЕШНИХ СКРИПТОВ (только HTTPS + опциональный SHA256)
-# ==============================================================================
-secure_download() {
-    local url="$1" dest="$2" expected_sha="${3:-}"
-    echo -e "${INFO} Скачивание: ${CYAN}$url${NC}"
-
-    if [[ ! "$url" =~ ^https:// ]]; then
-        echo -e "${CROSS_MARK} ${RED}Заблокировано: только HTTPS разрешён${NC}"
-        return 1
-    fi
-    if ! curl -fsSL --proto '=https' --tlsv1.2 --max-time 60 -o "$dest" "$url"; then
-        echo -e "${CROSS_MARK} Не удалось скачать $url"
-        return 1
-    fi
-    local sha; sha=$(sha256sum "$dest" | awk '{print $1}')
-    echo -e "  SHA256: ${YELLOW}$sha${NC}"
-    echo -e "  Размер: $(wc -c < "$dest") байт"
-    if [[ -n "$expected_sha" ]]; then
-        if [[ "$sha" != "$expected_sha" ]]; then
-            echo -e "${CROSS_MARK} ${RED}Хэш не совпал! Ожидалось: $expected_sha${NC}"
-            rm -f "$dest"; return 1
-        else
-            echo -e "${CHECK_MARK} Хэш совпал"
-        fi
-    else
-        echo -e "${WARNING} Верификация хэша отключена — скрипт запускается без проверки."
-    fi
-    chmod +x "$dest"; return 0
-}
-
-# run_verified_script "Name" "url" "sha" -- arg1 arg2 ...
-run_verified_script() {
-    local name="$1" url="$2" expected_sha="${3:-}"
-    shift 3
-    if [[ "${1:-}" == "--" ]]; then shift; fi
-    local args=("$@")
-    local tmp
-    tmp="/tmp/verified-$(echo "$name" | tr ' /' '_')-$$.sh"
-    echo -e "\n${CYAN}━━━━━━━━ $name ━━━━━━━━${NC}"
-    if secure_download "$url" "$tmp" "$expected_sha"; then
-        log "Running verified script: $name $url ${args[*]:-}"
-        bash "$tmp" "${args[@]}"
-        local rc=$?
-        rm -f "$tmp"; return $rc
-    else
-        echo -e "${CROSS_MARK} Пропуск $name"; return 1
-    fi
-}
-
-# ==============================================================================
 # МОДУЛЬ A: НАСТРОЙКА СЕРВЕРА (из Setup-and-Test-Server-Ubuntu-24)
 # ==============================================================================
 SYSCTL_CONF="/etc/sysctl.d/99-server.conf"
@@ -334,10 +275,6 @@ install_docker_apt() {
     apt_update || return 1
     apt_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || return 1
     systemctl enable --now docker >>"$(log_file)" 2>&1 || true
-    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
-        usermod -aG docker "$SUDO_USER" 2>/dev/null || true
-        log "Пользователь $SUDO_USER добавлен в группу docker"
-    fi
     local docker_ver
     docker_ver=$(docker --version 2>/dev/null || echo "not found")
     log "Docker установлен: $docker_ver"
@@ -593,32 +530,30 @@ base_setup() {
     pause_prompt
 }
 
-# UFW-менеджер (Balbuto/ufw-manager)
+# Статус UFW
 manage_ufw() {
     show_header; check_root || { pause_prompt; return; }
-    local UFW_DIR="$HOME/network-managers/ufw-manager"
-    mkdir -p "$(dirname "$UFW_DIR")"
-    if [[ ! -d "$UFW_DIR/.git" ]]; then
-        echo "Клонирую Balbuto/ufw-manager..."
-        git clone https://github.com/Balbuto/ufw-manager.git "$UFW_DIR" || { echo -e "${CROSS_MARK} Не удалось клонировать ufw-manager"; pause_prompt; return; }
-    else (cd "$UFW_DIR" && git fetch --all -q) || true; fi
-    cd "$UFW_DIR"; echo -e "\nПоследние коммиты:"; git log --oneline -5 2>/dev/null || true; echo ""
-    read -r -p "Проверить diff перед запуском? [Y/n] " d; d=${d:-Y}
-    if [[ $d =~ ^[Yy] ]]; then git diff HEAD 2>/dev/null || true; read -p "Запустить ufw-manager.sh? (y/N): " -n 1 -r; echo; [[ $REPLY =~ ^[Yy]$ ]] || { cd ~; return; }; fi
-    export SSH_CLIENT="${SSH_CLIENT:-0.0.0.0 22 0}"
-    bash ./ufw-manager.sh || true
-    cd ~
+    if ! command -v ufw >/dev/null; then
+        echo 'UFW не установлен.'
+    else
+        ufw status verbose || echo 'Не удалось получить статус UFW.'
+    fi
+    pause_prompt
 }
 # ==============================================================================
 # МОДУЛЬ B: УСТАНОВКА И УПРАВЛЕНИЕ НОДОЙ REMNAWAVE (из setup_node.sh v1.7.2)
 # ==============================================================================
 RN_APP_DIR="/opt/remnanode"
 RN_LOG_DIR="/var/log/remnanode"
+RN_NGINX_LOG_DIR="/var/log/nginx"
+RN_HOST_NGINX_ROTATE_FILE="/etc/logrotate.d/nginx"
+RN_UFW_DEFAULTS_FILE="/etc/default/ufw"
 RN_LOG_FILE="/var/log/remnanode_install.log"
 RN_XRAY_BIN_DIR="/opt/remnanode/bin"
-RN_XRAY_FILE="$RN_XRAY_BIN_DIR/xray"
 RN_CERTS_DIR="/opt/remnanode/certs"
-RN_WWW_DIR="/var/www/html"
+RN_WWW_DIR="$RN_APP_DIR/www"
+RN_LOGROTATE_FILE="/etc/logrotate.d/remnanode"
+RN_RENEW_HOOK="/etc/letsencrypt/renewal-hooks/deploy/safe-remnanode-managed-certs.sh"
 
 RN_XRAY_VERSION_CHOICE="built-in"
 RN_NODE_DOMAIN=""
@@ -633,18 +568,8 @@ rn_log() {
 # --- Сетевая оптимизация с автовыбором профиля по ОЗУ ---
 rn_optimize_network() {
     rn_log "${INFO_T} Настройка сетевого стека..."
-    if [ -f /etc/sysctl.d/99-remnanode.conf ]; then
-        cp /etc/sysctl.d/99-remnanode.conf /etc/sysctl.d/99-remnanode.conf.bak
-    fi
-    # КОНФЛИКТ-ФИКС: /etc/sysctl.d/99-server.conf (профиль из модуля настройки сервера)
-    # применяется sysctl ПОСЛЕ 99-remnanode.conf (лексический порядок) и перекрывал бы
-    # ключевые настройки профиля ноды (somaxconn, conntrack, буферы и т.п.).
-    # Отключаем его с бэкапом, чтобы профиль ноды применялся полностью.
-    if [ -f /etc/sysctl.d/99-server.conf ]; then
-        cp -a /etc/sysctl.d/99-server.conf "/etc/sysctl.d/99-server.conf.bak.$(date +%s)"
-        rm -f /etc/sysctl.d/99-server.conf
-        rn_log "${WARNING_T} /etc/sysctl.d/99-server.conf отключён (конфликт профилей), бэкап сохранён."
-    fi
+    backup_file /etc/sysctl.d/99-remnanode.conf || return 1
+    backup_file /etc/security/limits.d/99-remnanode.conf || return 1
     local ram_kb ram_gb
     ram_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
     ram_gb=$((ram_kb / 1024 / 1024))
@@ -726,15 +651,15 @@ root soft nofile 1048576
 root hard nofile 1048576
 EOF
 
-    sysctl --system >> "$RN_LOG_FILE" 2>&1 || true
+    sysctl -p /etc/sysctl.d/99-remnanode.conf >> "$RN_LOG_FILE" 2>&1 || return 1
     rn_log "${SUCCESS_T} Сетевые параметры ядра и системные лимиты успешно обновлены."
 }
 
 # --- Установка зависимостей ноды (с переиспользованием установленного Docker) ---
 rn_install_dependencies() {
     rn_log "${INFO_T} Установка необходимых пакетов..."
-    apt_update || true
-    apt_install curl wget jq unzip tar cron logrotate ufw certbot ca-certificates gnupg python3-pip perl openssl || true
+    apt_update || return 1
+    apt_install curl jq unzip logrotate ufw certbot ca-certificates gnupg openssl iproute2 util-linux || return 1
 
     if ! command -v docker &> /dev/null; then
         rn_log "${INFO_T} Docker не найден — установка через официальный репозиторий..."
@@ -742,130 +667,229 @@ rn_install_dependencies() {
     else
         rn_log "${SUCCESS_T} Docker уже установлен."
     fi
+    docker compose version >> "$RN_LOG_FILE" 2>&1 && docker info >> "$RN_LOG_FILE" 2>&1 || return 1
+    if ! docker compose up --help 2>> "$RN_LOG_FILE" | grep -- ' --wait ' >/dev/null; then
+        rn_log "${ERROR_T} Нужен Docker Compose с поддержкой up --wait."
+        return 1
+    fi
 }
 
 # --- Менеджер версий Xray-Core ---
-rn_select_xray_version() {
-    rn_log "${INFO_T} Получение версий Xray-Core с GitHub..."
-    local releases_json
-    releases_json=$(curl -fsSL https://api.github.com/repos/XTLS/Xray-core/releases 2>/dev/null || echo "")
-
-    if [ -z "$releases_json" ]; then
-        rn_log "${WARNING_T} Не удалось получить список версий с API GitHub. Будет установлена встроенная в контейнер версия."
-        RN_XRAY_VERSION_CHOICE="built-in"
-        return
-    fi
-
-    local versions
-    # || true: если jq отсутствует (редкий край), не роняем скрипт под set -e
-    versions=$(echo "$releases_json" | jq -r '.[] | "\(.tag_name) (Pre-release: \(.prerelease))"' 2>/dev/null || true)
-
-    echo -e "\n${BLUE}✨ ВЫБОР ВЕРСИИ XRAY-CORE${NC}"
-    echo -e "${GRAY}--------------------------------------------------${NC}"
-
-    local i=1
-    declare -A version_map
-
-    echo -e " 1) Использовать версию из контейнера (по умолчанию)"
-    version_map[1]="built-in"
-
-    while IFS= read -r line; do
-        if [ $i -ge 10 ]; then break; fi
-        local tag_name; tag_name=$(echo "$line" | awk '{print $1}')
-        local is_pre; is_pre=$(echo "$line" | grep -q "Pre-release: true" && echo "yes" || echo "no")
-
-        local display_tag="$tag_name"
-        if [ "$is_pre" = "yes" ]; then
-            display_tag="${tag_name} ${RED}[Pre-release]${NC}"
-        else
-            display_tag="${tag_name} ${GREEN}[Stable]${NC}"
-        fi
-
-        echo -e " $((i+1))) Xray-Core $display_tag"
-        version_map[$((i+1))]="$tag_name"
-        ((i++))
-    done <<< "$versions"
-
-    echo -e "${GRAY}--------------------------------------------------${NC}"
-    read -r -p "Выберите номер версии [1]: " version_num
-    version_num=${version_num:-1}
-
-    RN_XRAY_VERSION_CHOICE="${version_map[$version_num]:-built-in}"
-    rn_log "${SUCCESS_T} Выбран вариант: ${CYAN}$RN_XRAY_VERSION_CHOICE${NC}"
-
-    if [ "$RN_XRAY_VERSION_CHOICE" != "built-in" ]; then
-        if ! rn_download_xray_core "$RN_XRAY_VERSION_CHOICE"; then
-            rn_log "${WARNING_T} Не удалось загрузить выбранную версию — будет использована встроенная в контейнер."
-            RN_XRAY_VERSION_CHOICE="built-in"
-        fi
-    fi
+rn_valid_xray_tag() {
+    [[ "$1" =~ ^v[0-9]+([.][0-9]+){1,3}([.-][A-Za-z0-9]+)*$ ]]
 }
 
-rn_download_xray_core() {
+rn_prepare_xray_version() {
     local version="$1"
-    rn_log "${INFO_T} Загрузка Xray-Core ${version} для архитектуры ${ARCH_XRAY}..."
-
-    mkdir -p "$RN_XRAY_BIN_DIR"
-    local temp_dir; temp_dir=$(mktemp -d)
-
-    local download_url="https://github.com/XTLS/Xray-core/releases/download/${version}/Xray-linux-${ARCH_XRAY}.zip"
-
-    if ! wget -q --show-progress -O "$temp_dir/xray.zip" "$download_url"; then
-        rn_log "${ERROR_T} Не удалось скачать Xray-Core!"
-        rm -rf "$temp_dir"
+    rn_valid_xray_tag "$version" || { rn_log "${ERROR_T} Некорректный тег релиза Xray-Core."; return 1; }
+    if ! rn_download_xray_core "$version"; then
+        rn_log "${ERROR_T} Не удалось скачать или проверить Xray-Core $version. Работающий деплой не изменён."
         return 1
     fi
-
-    unzip -q -o "$temp_dir/xray.zip" -d "$temp_dir"
-    mv "$temp_dir/xray" "$RN_XRAY_FILE"
-    chmod +x "$RN_XRAY_FILE"
-
-    mv "$temp_dir/geoip.dat" "$RN_XRAY_BIN_DIR/geoip.dat" 2>/dev/null || true
-    mv "$temp_dir/geosite.dat" "$RN_XRAY_BIN_DIR/geosite.dat" 2>/dev/null || true
-
-    rm -rf "$temp_dir"
-    rn_log "${SUCCESS_T} Xray-Core успешно сохранен в $RN_XRAY_FILE"
+    RN_XRAY_VERSION_CHOICE="$version"
+    rn_log "${SUCCESS_T} Xray-Core $version скачан и проверен."
 }
 
+rn_prepare_latest_xray() {
+    local release version
+    rn_log "${INFO_T} Запрашиваю последний стабильный релиз Xray-Core на GitHub..."
+    if ! release=$(curl -fsSL --proto '=https' --connect-timeout 5 --max-time 20 \
+        --retry 2 --retry-max-time 30 --header 'Accept: application/vnd.github+json' \
+        'https://api.github.com/repos/XTLS/Xray-core/releases/latest' 2>>"$RN_LOG_FILE"); then
+        rn_log "${ERROR_T} API GitHub недоступен. Проверьте подключение и повторите; встроенная версия не подставляется."
+        return 1
+    fi
+    if ! version=$(jq -er 'select(.draft == false and .prerelease == false) | .tag_name | strings' <<< "$release" 2>>"$RN_LOG_FILE"); then
+        rn_log "${ERROR_T} GitHub не вернул корректный стабильный релиз."
+        return 1
+    fi
+    rn_prepare_xray_version "$version"
+}
+
+rn_download_xray_core() (
+    local version="$1" dir archive digest url
+    rn_valid_xray_tag "$version" || return 1
+    archive="Xray-linux-${ARCH_XRAY}.zip"
+    url="https://github.com/XTLS/Xray-core/releases/download/${version}/${archive}"
+    dir=$(mktemp -d "$RN_APP_DIR/.xray-download.XXXXXXXX") || return 1
+    trap 'rm -rf -- "$dir"' EXIT
+    curl -fsSL --proto '=https' --connect-timeout 10 --max-time 180 -o "$dir/release.zip" "$url" || return 1
+    curl -fsSL --proto '=https' --connect-timeout 10 --max-time 30 -o "$dir/release.dgst" "$url.dgst" || return 1
+    digest=$(awk 'toupper($0) ~ /SHA(2-)?256/ {print $NF; exit}' "$dir/release.dgst")
+    [[ "$digest" =~ ^[a-fA-F0-9]{64}$ ]] || return 1
+    printf '%s  %s\n' "$digest" "$dir/release.zip" | sha256sum -c --status || return 1
+    mkdir -p "$RN_XRAY_BIN_DIR" || return 1
+    install -d -m 0755 "$dir/bin" || return 1
+    local name mode
+    for name in xray geoip.dat geosite.dat; do
+        mode=0644
+        [[ "$name" != xray ]] || mode=0755
+        unzip -p "$dir/release.zip" "$name" > "$dir/bin/$name" && [[ -s "$dir/bin/$name" ]] || return 1
+        chmod "$mode" "$dir/bin/$name" || return 1
+    done
+    if [[ -e "$RN_XRAY_BIN_DIR/$version" ]]; then
+        for name in xray geoip.dat geosite.dat; do
+            cmp -s "$dir/bin/$name" "$RN_XRAY_BIN_DIR/$version/$name" || {
+                rn_log "${ERROR_T} Содержимое существующей версии $version отличается. Файлы не изменены."
+                return 1
+            }
+        done
+        return 0
+    fi
+    mv -T -- "$dir/bin" "$RN_XRAY_BIN_DIR/$version"
+)
+
 # --- Логирование и ротация логов на хосте ---
-rn_setup_logging_and_rotation() {
-    rn_log "${INFO_T} Настройка папок логов и автоматической ротации..."
+rn_nginx_log_dir() {
+    if [[ -f "$RN_HOST_NGINX_ROTATE_FILE" ]]; then
+        # Do not share paths with a native nginx or its distribution logrotate policy.
+        printf '%s/nginx\n' "$RN_LOG_DIR"
+    else
+        printf '%s\n' "$RN_NGINX_LOG_DIR"
+    fi
+}
 
-    mkdir -p "$RN_LOG_DIR/node"
-    mkdir -p "$RN_LOG_DIR/nginx"
+rn_prepare_log_paths() {
+    local nginx_log_dir="$1" dir path
+    for dir in "$RN_LOG_DIR" "$RN_LOG_DIR/xray" "$nginx_log_dir"; do
+        if [[ -L "$dir" ]]; then
+            rn_log "${ERROR_T} Не использую симлинк в качестве каталога логов: $dir"
+            return 1
+        fi
+        if [[ ! -d "$dir" ]]; then install -d -m 0755 "$dir" || return 1; fi
+    done
+    for path in "$RN_LOG_DIR"/{access,error}.log "$nginx_log_dir"/{access,error}.log; do
+        if [[ -L "$path" || ( -e "$path" && ! -f "$path" ) ]]; then
+            rn_log "${ERROR_T} Ожидался обычный файл лога: $path"
+            return 1
+        fi
+        if [[ ! -f "$path" ]]; then (umask 027; set -o noclobber; : > "$path") || return 1; fi
+    done
+}
 
-    local logrotate_config="/etc/logrotate.d/remnanode"
+rn_enable_logrotate_scheduler() {
+    if [[ -d /run/systemd/system ]]; then
+        systemctl is-active --quiet logrotate.timer || systemctl enable --now logrotate.timer >> "$RN_LOG_FILE" 2>&1
+    elif [[ -x /etc/cron.daily/logrotate ]] && command -v cron >/dev/null; then
+        rn_log "${INFO_T} Используется cron.daily/logrotate; убедитесь, что cron запущен."
+    else
+        rn_log "${ERROR_T} Не найден logrotate.timer или cron.daily/logrotate. Включите системный планировщик ротации."
+        return 1
+    fi
+}
 
-    cat > "$logrotate_config" <<EOF
-$RN_LOG_DIR/node/*.log $RN_LOG_DIR/nginx/*.log {
+rn_setup_logging_and_rotation() (
+    local nginx_log_dir="$1" tmp
+    tmp=$(mktemp "$(dirname "$RN_LOGROTATE_FILE")/.remnanode-rotate.XXXXXXXX") || return 1
+    trap 'rm -f -- "$tmp"' EXIT
+    cat > "$tmp" <<EOF || return 1
+$RN_LOG_DIR/access.log $RN_LOG_DIR/error.log {
     daily
-    size 50M
+    maxsize 50M
     rotate 7
     compress
     delaycompress
     missingok
     notifempty
     copytruncate
+}
+
+$nginx_log_dir/access.log $nginx_log_dir/error.log {
+    daily
+    maxsize 50M
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root root
     sharedscripts
     postrotate
-        docker restart remnawave-nginx 2>/dev/null || true
+        if [ "\$(docker inspect --format '{{.State.Running}}' remnawave-nginx 2>/dev/null)" = true ]; then
+            docker kill --signal=USR1 remnawave-nginx >/dev/null
+        fi
     endscript
 }
 EOF
+    if ! logrotate -d -s /dev/null "$tmp" >> "$RN_LOG_FILE" 2>&1; then
+        rn_log "${ERROR_T} Проверка logrotate не прошла. См. $RN_LOG_FILE."
+        return 1
+    fi
+    if ! rn_enable_logrotate_scheduler; then
+        rn_log "${ERROR_T} Не удалось включить планировщик logrotate. См. $RN_LOG_FILE."
+        return 1
+    fi
+    if [[ ! -f "$RN_LOGROTATE_FILE" ]] || ! cmp -s -- "$tmp" "$RN_LOGROTATE_FILE"; then
+        chmod 0644 "$tmp" && mv -fT -- "$tmp" "$RN_LOGROTATE_FILE" || return 1
+    fi
+    rn_log "${SUCCESS_T} Логи на хосте: $RN_LOG_DIR и $nginx_log_dir. Настроен logrotate."
+)
 
-    chmod 644 "$logrotate_config"
-    rn_log "${SUCCESS_T} Лог-файлы будут записываться на хосте в каталог ${BLUE}$RN_LOG_DIR${NC}"
-    rn_log "${SUCCESS_T} Logrotate настроен: ротация ежедневная / при достижении 50MB, хранение 7 архивов."
+rn_valid_domain() {
+    local domain="$1"
+    [[ ${#domain} -le 253 && "$domain" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?[.])+[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]
 }
 
-rn_extract_base_domain() {
-    local domain="$1"
-    echo "$domain" | awk -F. '{ if (NF <= 2) print $0; else print $(NF-1)"."$NF }'
+rn_valid_reality_sni() {
+    rn_valid_domain "$1" && [[ ! "$1" =~ ^[0-9.]+$ ]]
+}
+
+rn_prompt_reality_sni() {
+    local sni
+    printf '%s\n' 'Укажите DNS-имя SNI из Reality-профиля Remnawave (serverNames), не адрес ноды.'
+    while read -r -p 'SNI для VLESS-Reality (например www.example.org): ' sni; do
+        if rn_valid_reality_sni "$sni"; then
+            RN_DECOY_DOMAIN="${sni,,}"
+            printf 'SNI: %s. Установщик использует его в nginx; профиль Remnawave не изменяется.\n' "$RN_DECOY_DOMAIN"
+            return 0
+        fi
+        printf '%s\n' 'Введите полное DNS-имя без https://, порта, пути или wildcard. IP не подходит.' >&2
+    done
+    rn_log "${ERROR_T} SNI не задан. Установка не продолжена."
+    return 1
+}
+
+rn_valid_ipv4() {
+    local octet
+    [[ "$1" =~ ^(0|[1-9][0-9]{0,2})([.](0|[1-9][0-9]{0,2})){3}$ ]] || return 1
+    local -a octets
+    IFS=. read -ra octets <<< "$1"
+    for octet in "${octets[@]}"; do (( octet <= 255 )) || return 1; done
+}
+
+rn_valid_port() {
+    [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (( $1 <= 65535 ))
+}
+
+rn_public_range_ok() {
+    local control="$1" first="${2%%:*}" last="${2##*:}"
+    [[ "$2" != *:*:* ]] || return 1
+    rn_valid_port "$control" && rn_valid_port "$first" && rn_valid_port "$last" || return 1
+    (( first <= last && (control < first || control > last) ))
+}
+
+# ACME rejects an exact SAN when another SAN in the order already covers it.
+rn_build_acme_names() {
+    local hostname="${1,,}" zone="${2,,}" relative
+    local -n acme_args="$3"
+    rn_valid_domain "$hostname" || return 1
+    if [[ -z "$zone" ]]; then
+        acme_args=(-d "$hostname")
+        return 0
+    fi
+    rn_valid_domain "$zone" && [[ "$hostname" == "$zone" || "$hostname" == *".$zone" ]] || return 1
+    acme_args=(-d "$zone" -d "*.$zone")
+    if [[ "$hostname" != "$zone" ]]; then
+        relative="${hostname%".$zone"}"
+        # A wildcard covers only one label, so deeper descendants need their own SAN.
+        if [[ "$relative" == *.* ]]; then acme_args+=(-d "$hostname"); fi
+    fi
 }
 
 # --- Универсальный выпуск SSL (Cloudflare DNS / Standalone / Gcore DNS) ---
-rn_issue_ssl_certificates_multi() {
-    local domain="$1"
+rn_issue_ssl_certificates_multi() (
+    umask 077
+    local domain="$1" deploy_mode="${2:-}" deployment_ports="${3:-}"
 
     echo -e "\n${BLUE}🔐 ВЫБОР МЕТОДА ВЫПУСКА SSL СЕРТИФИКАТА${NC}"
     echo -e "${GRAY}--------------------------------------------------${NC}"
@@ -876,8 +900,16 @@ rn_issue_ssl_certificates_multi() {
     read -r -p "Выберите метод выпуска [2]: " ssl_method
     ssl_method=${ssl_method:-2}
 
-    local base_domain; base_domain=$(rn_extract_base_domain "$domain")
-    local wildcard_domain="*.$base_domain"
+    local cert_name="safe-remnanode-$domain" base_domain=""
+    local -a names=()
+    if [[ "$ssl_method" == 1 || "$ssl_method" == 3 ]]; then
+        read -r -p "Зона для wildcard (Enter: сертификат только для $domain): " base_domain || return 1
+    fi
+    rn_build_acme_names "$domain" "$base_domain" names || {
+        rn_log "${ERROR_T} Некорректное имя ноды или DNS-зона не соответствует имени."
+        return 1
+    }
+    rn_log "${INFO_T} Имена в запросе Certbot: ${names[*]}"
 
     read -r -p "Введите ваш email для Let's Encrypt: " le_email
     while [ -z "$le_email" ]; do
@@ -889,7 +921,7 @@ rn_issue_ssl_certificates_multi() {
     case $ssl_method in
         1)
             rn_log "${INFO_T} Подготовка к выпуску сертификата через Cloudflare API (DNS-01)..."
-            apt_install python3-certbot-dns-cloudflare || true
+            apt_install python3-certbot-dns-cloudflare || return 1
 
             echo -e "\nВыберите метод авторизации Cloudflare:"
             echo " 1) Через API Token (Рекомендуется, более безопасно)"
@@ -900,13 +932,15 @@ rn_issue_ssl_certificates_multi() {
             mkdir -p ~/.secrets/certbot
 
             if [ "$cf_auth_method" -eq 1 ]; then
-                read -r -p "Введите ваш Cloudflare API Token: " cf_token
+                read -rs -p "Введите ваш Cloudflare API Token: " cf_token || return 1
+                printf '\n'
                 cat > ~/.secrets/certbot/cloudflare.ini <<EOL
 dns_cloudflare_api_token = $cf_token
 EOL
             else
                 read -r -p "Введите ваш Cloudflare Email: " cf_email
-                read -r -p "Введите ваш Global API Key: " cf_key
+                read -rs -p "Введите ваш Global API Key: " cf_key || return 1
+                printf '\n'
                 cat > ~/.secrets/certbot/cloudflare.ini <<EOL
 dns_cloudflare_email = $cf_email
 dns_cloudflare_api_key = $cf_key
@@ -915,22 +949,19 @@ EOL
 
             chmod 600 ~/.secrets/certbot/cloudflare.ini
 
-            rn_log "${INFO_T} Запуск выпуска Wildcard-сертификата (*.${base_domain})..."
+            rn_log "${INFO_T} Запуск выпуска DNS-01 сертификата для $domain..."
             if certbot certonly \
                 --dns-cloudflare \
                 --dns-cloudflare-credentials ~/.secrets/certbot/cloudflare.ini \
                 --dns-cloudflare-propagation-seconds 60 \
-                -d "$base_domain" \
-                -d "$wildcard_domain" \
+                --cert-name "$cert_name" "${names[@]}" \
                 --email "$le_email" \
                 --agree-tos \
                 --non-interactive \
                 --key-type ecdsa \
                 --elliptic-curve secp384r1 >> "$RN_LOG_FILE" 2>&1; then
 
-                cp "/etc/letsencrypt/live/$base_domain/fullchain.pem" "$RN_CERTS_DIR/fullchain.pem"
-                cp "/etc/letsencrypt/live/$base_domain/privkey.pem" "$RN_CERTS_DIR/privkey.pem"
-                rn_log "${SUCCESS_T} Wildcard SSL сертификат успешно выпущен через Cloudflare DNS!"
+                rn_log "${SUCCESS_T} SSL-сертификат успешно выпущен через Cloudflare DNS!"
             else
                 rn_log "${ERROR_T} Ошибка выпуска сертификата через Cloudflare API! Проверьте лог $RN_LOG_FILE"
                 return 1
@@ -940,42 +971,34 @@ EOL
         2)
             rn_log "${INFO_T} Выпуск сертификата в Standalone режиме (HTTP-01)..."
 
-            systemctl stop nginx 2>/dev/null || true
-            docker stop remnawave-nginx 2>/dev/null || true
-
-            if command -v ufw &> /dev/null; then
-                ufw allow 80/tcp comment 'HTTP for Certbot verification' >/dev/null 2>&1
-                ufw reload >/dev/null 2>&1
-            fi
-
-            rn_log "${INFO_T} Проверка освобождения порта 80 перед запуском certbot..."
-            local port_80_wait=15
-            local port_80_free=0
-            local i
-            for ((i=1; i<=port_80_wait; i++)); do
-                if ! ss -tln 2>/dev/null | awk '$4 ~ /:80$/ {busy=1} END {exit busy}'; then
-                    port_80_free=1
-                    break
-                fi
-                sleep 1
-            done
-            if [ "$port_80_free" -ne 1 ]; then
-                rn_log "${ERROR_T} Порт 80 всё ещё занят после остановки контейнеров. Освободите его вручную и повторите выпуск SSL."
+            local listeners
+            listeners=$(ss -H -ltn 'sport = :80') || return 1
+            if [[ -n "$listeners" ]]; then
+                rn_log "${ERROR_T} Порт 80 занят. Используйте DNS-01 или освободите его вручную. Службы не остановлены."
                 return 1
             fi
-            rn_log "${SUCCESS_T} Порт 80 свободен. Запускаем certbot --standalone..."
+
+            if [[ "$deploy_mode" == combined ]]; then
+                if [[ -z "$deployment_ports" && -r "$RN_APP_DIR/.transport_ports" ]]; then
+                    deployment_ports=$(cat "$RN_APP_DIR/.transport_ports") || return 1
+                fi
+                if grep -Eq '^(TLS_TCP|XHTTP_TCP)=80$' <<< "$deployment_ports"; then
+                    rn_log "${ERROR_T} В профиле Xray задан TCP/80: Standalone не сможет продлевать сертификат после запуска ноды. Используйте DNS-01."
+                    return 1
+                fi
+                rn_log "${INFO_T} Standalone требует TCP/80 для выпуска и последующего продления; добавляю отдельное правило UFW."
+                rn_check_ufw_ready && rn_ufw_allow 80/tcp comment 'HTTP / Certbot' || return 1
+            fi
 
             if certbot certonly \
                 --standalone \
-                -d "$domain" \
+                --cert-name "$cert_name" "${names[@]}" \
                 --email "$le_email" \
                 --agree-tos \
                 --non-interactive \
                 --key-type ecdsa \
                 --elliptic-curve secp384r1 >> "$RN_LOG_FILE" 2>&1; then
 
-                cp "/etc/letsencrypt/live/$domain/fullchain.pem" "$RN_CERTS_DIR/fullchain.pem"
-                cp "/etc/letsencrypt/live/$domain/privkey.pem" "$RN_CERTS_DIR/privkey.pem"
                 rn_log "${SUCCESS_T} SSL сертификат успешно выпущен в Standalone режиме!"
             else
                 rn_log "${ERROR_T} Не удалось выпустить SSL сертификат! Ознакомьтесь с логом $RN_LOG_FILE"
@@ -986,13 +1009,13 @@ EOL
         3)
             rn_log "${INFO_T} Подготовка к выпуску сертификата через Gcore DNS API (DNS-01)..."
 
-            if ! certbot plugins 2>/dev/null | grep -q "dns-gcore"; then
-                rn_log "${INFO_T} Установка плагина certbot-dns-gcore..."
-                python3 -m pip install --break-system-packages certbot-dns-gcore >> "$RN_LOG_FILE" 2>&1 || \
-                python3 -m pip install certbot-dns-gcore >> "$RN_LOG_FILE" 2>&1
+            if ! certbot plugins 2>/dev/null | grep "dns-gcore" >/dev/null; then
+                rn_log "${ERROR_T} Установите совместимый плагин dns-gcore в окружение Certbot и повторите."
+                return 1
             fi
 
-            read -r -p "Введите ваш Gcore API Token: " gcore_token
+            read -rs -p "Введите ваш Gcore API Token: " gcore_token || return 1
+            printf '\n'
 
             mkdir -p ~/.secrets/certbot
             cat > ~/.secrets/certbot/gcore.ini <<EOL
@@ -1000,22 +1023,19 @@ dns_gcore_apitoken = $gcore_token
 EOL
             chmod 600 ~/.secrets/certbot/gcore.ini
 
-            rn_log "${INFO_T} Запуск выпуска Wildcard-сертификата (*.${base_domain}) через Gcore..."
+            rn_log "${INFO_T} Запуск выпуска DNS-01 сертификата для $domain через Gcore..."
             if certbot certonly \
                 --authenticator dns-gcore \
                 --dns-gcore-credentials ~/.secrets/certbot/gcore.ini \
                 --dns-gcore-propagation-seconds 80 \
-                -d "$base_domain" \
-                -d "$wildcard_domain" \
+                --cert-name "$cert_name" "${names[@]}" \
                 --email "$le_email" \
                 --agree-tos \
                 --non-interactive \
                 --key-type ecdsa \
                 --elliptic-curve secp384r1 >> "$RN_LOG_FILE" 2>&1; then
 
-                cp "/etc/letsencrypt/live/$base_domain/fullchain.pem" "$RN_CERTS_DIR/fullchain.pem"
-                cp "/etc/letsencrypt/live/$base_domain/privkey.pem" "$RN_CERTS_DIR/privkey.pem"
-                rn_log "${SUCCESS_T} Wildcard SSL сертификат успешно выпущен через Gcore DNS!"
+                rn_log "${SUCCESS_T} SSL-сертификат успешно выпущен через Gcore DNS!"
             else
                 rn_log "${ERROR_T} Ошибка выпуска сертификата через Gcore API! Проверьте лог $RN_LOG_FILE"
                 return 1
@@ -1027,150 +1047,358 @@ EOL
             ;;
     esac
 
-    chmod 600 "$RN_CERTS_DIR/"*
+    local renew_hook_file="$RN_RENEW_HOOK"
+    local lineage="/etc/letsencrypt/live/$cert_name"
+    local target="$RN_CERTS_DIR/managed/$domain" tmp
+    mkdir -p "$target" "$(dirname "$renew_hook_file")" || return 1
+    tmp=$(mktemp -d "$target/.deploy.XXXXXXXX") || return 1
+    trap 'rm -rf -- "$tmp" "${hook_tmp:-}"' EXIT
+    install -m 0644 "$lineage/fullchain.pem" "$tmp/fullchain.pem" || return 1
+    install -m 0600 "$lineage/privkey.pem" "$tmp/privkey.pem" || return 1
+    mv -fT "$tmp/fullchain.pem" "$target/fullchain.pem" &&
+        mv -fT "$tmp/privkey.pem" "$target/privkey.pem" || return 1
 
-    local active_domain="$domain"
-    if [ "$ssl_method" -eq 1 ] || [ "$ssl_method" -eq 3 ]; then
-        active_domain="$base_domain"
+    if [[ -n "$base_domain" ]]; then
+        printf '%s\n' "${base_domain,,}" > "$tmp/.wildcard_zone" && mv -fT "$tmp/.wildcard_zone" "$target/.wildcard_zone" || return 1
+    else
+        rm -f -- "$target/.wildcard_zone" || return 1
     fi
 
-    local renew_hook_file="/etc/letsencrypt/renewal-hooks/deploy/copy-remnanode-certs.sh"
-    mkdir -p "$(dirname "$renew_hook_file")"
-    cat > "$renew_hook_file" <<EOF
+    local hook_tmp
+    hook_tmp=$(mktemp "$(dirname "$renew_hook_file")/.remnanode-hook.XXXXXXXX") || return 1
+    if [[ ! -f "$renew_hook_file" || $(head -n 2 "$renew_hook_file" | tail -n 1) == '# safe-remnanode managed certificate hook' ]]; then
+        cat > "$hook_tmp" <<'EOF' || return 1
 #!/bin/bash
-if [ -d "/etc/letsencrypt/live/$active_domain" ]; then
-    cp "/etc/letsencrypt/live/$active_domain/fullchain.pem" "$RN_CERTS_DIR/fullchain.pem"
-    cp "/etc/letsencrypt/live/$active_domain/privkey.pem" "$RN_CERTS_DIR/privkey.pem"
-    chmod 600 "$RN_CERTS_DIR/"*
-    docker restart remnanode 2>/dev/null || true
+# safe-remnanode managed certificate hook
+set -euo pipefail
+umask 077
+app=/opt/remnanode
+[[ -r "$app/.node_domain" ]] || exit 0
+IFS= read -r domain < "$app/.node_domain"
+[[ "$domain" =~ ^[A-Za-z0-9.-]+$ && "$domain" != '.' && "$domain" != '..' ]] || exit 1
+[[ ${RENEWED_LINEAGE:-} == "/etc/letsencrypt/live/safe-remnanode-$domain" ]] || exit 0
+certs="$app/certs/managed/$domain"
+[[ -d "$certs" ]] || exit 0
+tmp=$(mktemp -d "$certs/.renew.XXXXXXXX")
+trap 'rm -rf -- "$tmp"' EXIT
+install -m 0644 "$RENEWED_LINEAGE/fullchain.pem" "$tmp/fullchain.pem"
+install -m 0600 "$RENEWED_LINEAGE/privkey.pem" "$tmp/privkey.pem"
+mv -fT "$tmp/fullchain.pem" "$certs/fullchain.pem"
+mv -fT "$tmp/privkey.pem" "$certs/privkey.pem"
+docker restart remnanode
+if [[ -f "$app/nginx.conf" ]] &&
+   grep -Eq '^[[:space:]]*ssl_certificate[[:space:]]+"?/etc/letsencrypt/live/' "$app/nginx.conf" &&
+   [[ $(docker inspect --format '{{.State.Running}}' remnawave-nginx 2>/dev/null) == true ]]; then
+    docker kill --signal=HUP remnawave-nginx >/dev/null
 fi
 EOF
-    chmod +x "$renew_hook_file"
-}
-
-# --- Маскировочные шаблоны (Selfsteal + мутатор Mrvibecodic/node-templates) ---
-rn_generate_masked_template() {
-    local decoy_domain="$1"
-    local chosen_template_arg="${2:-}"
-
-    rn_log "${INFO_T} Загрузка профессиональных шаблонов маскировки Mrvibecodic/node-templates..."
-
-    mkdir -p "$RN_WWW_DIR"
-    local temp_zip; temp_zip=$(mktemp)
-
-    local templates_url="https://github.com/Mrvibecodic/node-templates/archive/refs/heads/main.zip"
-    if ! wget -q -O "$temp_zip" "$templates_url"; then
-        rn_log "${WARNING_T} Не удалось скачать шаблоны Mrvibecodic, генерируем базовую уникальную HTML заглушку."
-        rn_create_fallback_html "$decoy_domain"
-        rm -f "$temp_zip"
-        return
-    fi
-
-    local temp_unzip; temp_unzip=$(mktemp -d)
-    unzip -q -o "$temp_zip" -d "$temp_unzip"
-
-    local repo_root="$temp_unzip/node-templates-main"
-    if [ ! -d "$repo_root" ]; then
-        rn_log "${WARNING_T} Ошибка структуры архива. Генерируем базовую HTML заглушку."
-        rn_create_fallback_html "$decoy_domain"
-        rm -rf "$temp_unzip" "$temp_zip"
-        return
-    fi
-
-    local templates=("endless-verify" "esports-stream-template" "levelup-hub" "playza-game-catalog" "rybaliti-2.0" "screenwire-digest" "vibrai-photo-editor" "worldzoo-stream-template")
-
-    local selected_template=""
-    if [ -n "$chosen_template_arg" ]; then
-        selected_template="$chosen_template_arg"
+        chmod 0700 "$hook_tmp" && mv -fT "$hook_tmp" "$renew_hook_file" || return 1
     else
-        selected_template="${templates[$RANDOM % ${#templates[@]}]}"
+        rn_log "${WARNING_T} Путь к новому Certbot hook уже занят сторонним скриптом. Файл оставлен без изменений."
+        return 1
     fi
+)
 
-    rn_log "${INFO_T} Выбран профессиональный шаблон маскировки: ${CYAN}$selected_template${NC}"
+# --- Встроенные статические шаблоны без внешних ресурсов ---
+# Фиксированный каталог: идентификатор темы не используется как имя файла или команда.
+rn_render_page_template() (
+    local template="${1:-status}" title subtitle label bg surface fg muted accent
+    case "$template" in
+        status)
+            title='Технические работы'; subtitle='Мы обновляем сайт. Пожалуйста, зайдите немного позже.'
+            label='Обслуживание'; bg='#eef3f8'; surface='#ffffff'; fg='#15263b'; muted='#43546b'; accent='#174da1'
+            ;;
+        minimal)
+            title='Скоро вернёмся'; subtitle='Страница временно недоступна. Спасибо за терпение.'
+            label='Уведомление'; bg='#f8f2e7'; surface='#fffdfa'; fg='#2f2118'; muted='#655346'; accent='#923416'
+            ;;
+        dark)
+            title='Сайт временно недоступен'; subtitle='Сервис на паузе, пока мы проводим обслуживание.'
+            label='Техническая пауза'; bg='#101722'; surface='#1a2636'; fg='#f1f6fd'; muted='#b5c3d5'; accent='#81e3ba'
+            ;;
+        *) return 1 ;;
+    esac
 
-    local temp_out; temp_out=$(mktemp -d)
-
-    rn_log "${INFO_T} Запуск мутатора уникальности кода 'uniquify-theme'..."
-    if bash "$repo_root/uniquify-theme.sh" \
-        -s "$repo_root/$selected_template" \
-        -o "$temp_out" \
-        --seed "$(openssl rand -hex 16)" \
-        --no-zip \
-        --no-install-deps >> "$RN_LOG_FILE" 2>&1; then
-
-        rm -rf "${RN_WWW_DIR:?}"/* 2>/dev/null || true
-        mkdir -p "$RN_WWW_DIR"
-        cp -r "$temp_out"/* "$RN_WWW_DIR/"
-        rn_log "${SUCCESS_T} Маскировочный сайт успешно сгенерирован и полностью уникализирован по хэшам и классам!"
-    else
-        rn_log "${WARNING_T} Ошибка работы мутатора uniquify-theme. Копируем файлы без мутации."
-        rm -rf "${RN_WWW_DIR:?}"/* 2>/dev/null || true
-        mkdir -p "$RN_WWW_DIR"
-        cp -r "$repo_root/$selected_template"/* "$RN_WWW_DIR/"
-    fi
-
-    rm -rf "$temp_unzip" "$temp_zip" "${temp_out:-}"
-}
-
-rn_create_fallback_html() {
-    local domain="$1"
-    mkdir -p "$RN_WWW_DIR"
-    local rand_id; rand_id=$(openssl rand -hex 8)
-    cat > "$RN_WWW_DIR/index.html" <<EOF
-<!DOCTYPE html>
+    install -d -m 0755 "$RN_WWW_DIR" || return 1
+    local tmp
+    tmp=$(mktemp "$RN_WWW_DIR/.index.XXXXXXXX") || return 1
+    trap 'rm -f -- "$tmp"' EXIT
+    cat > "$tmp" <<EOF || return 1
+<!doctype html>
 <html lang="ru">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="server-hash" content="${rand_id}">
-    <title>Сайт на реконструкции</title>
-    <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background-color: #f8f9fa; color: #212529; margin: 0; }
-        .container { text-align: center; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); background: white; }
-        h1 { font-size: 24px; margin-bottom: 8px; }
-        p { color: #6c757d; font-size: 14px; }
-    </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="$([[ "$template" == dark ]] && printf dark || printf light)">
+<meta name="remnanode-template" content="$template">
+<title>$title</title>
+<style>
+:root{background:$bg;color:$fg;font-family:system-ui,sans-serif}
+*{box-sizing:border-box}
+body{min-height:100vh;margin:0;display:grid;place-items:center;padding:1.5rem}
+main{background:$surface;width:min(100%,39rem);padding:clamp(1.75rem,7vw,4rem);border-radius:1.25rem;border:1px solid $muted}
+.tag{color:$accent;font-size:.8rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase}
+h1{font-size:clamp(2rem,7vw,3.6rem);line-height:1.04;letter-spacing:-.04em;margin:1rem 0;overflow-wrap:anywhere}
+p{font-size:1.05rem;line-height:1.6;color:$muted;margin-bottom:0}
+</style>
 </head>
-<body>
-    <div class="container">
-        <h1>Сайт временно недоступен</h1>
-        <p>На данном ресурсе ведутся запланированные технические работы. Пожалуйста, зайдите позже.</p>
-    </div>
-</body>
+<body><main>
+<div class="tag">$label</div>
+<h1>$title</h1>
+<p>$subtitle</p>
+</main></body>
 </html>
 EOF
+    chmod 0644 "$tmp" && mv -fT -- "$tmp" "$RN_WWW_DIR/index.html"
+)
+
+rn_pick_page_template() {
+    local selection
+    local -a templates=(status minimal dark)
+    printf '%s\n' 'Темы: 1 — статус, 2 — минимализм, 3 — тёмная, 4 — случайная, 0 — отмена.' >&2
+    read -r -p 'Выберите тему [1]: ' selection || return 1
+    case "${selection:-1}" in
+        1) printf 'status\n' ;;
+        2) printf 'minimal\n' ;;
+        3) printf 'dark\n' ;;
+        4) printf '%s\n' "${templates[RANDOM % ${#templates[@]}]}" ;;
+        0) return 2 ;;
+        *) printf '%s\n' 'Некорректный номер темы.' >&2; return 1 ;;
+    esac
+}
+
+rn_valid_cert_path_domain() {
+    local hostname="${1,,}" alias_name="${2,,}"
+    rn_valid_domain "$hostname" && rn_valid_domain "$alias_name" &&
+        [[ "$hostname" == "$alias_name" || "$hostname" == *".$alias_name" ]]
+}
+
+rn_cert_volume_lines() {
+    local source_dir="$1" dest_dir="$2" type="$3"
+    if [[ "$type" == directory ]]; then
+        printf '      - %s:%s:ro\n' "$source_dir" "$dest_dir"
+    else
+        printf '      - %s/fullchain.pem:%s/fullchain.pem:ro\n      - %s/privkey.pem:%s/privkey.pem:ro\n' "$source_dir" "$dest_dir" "$source_dir" "$dest_dir"
+    fi
+}
+
+rn_validate_transport_ports() {
+    local control_port="$1" tls_tcp="$2" xhttp="$3" hy2_udp="$4" port
+    local xhttp_port="${xhttp%/*}" xhttp_proto=tcp
+    if [[ "$xhttp" == */* ]]; then xhttp_proto="${xhttp##*/}"; fi
+    [[ "$xhttp_proto" == tcp || "$xhttp_proto" == udp ]] || return 1
+    rn_valid_port "$control_port" || return 1
+    for port in "$tls_tcp" "$xhttp_port" "$hy2_udp"; do
+        rn_valid_port "$port" && [[ "$port" != "$control_port" && "$port" != 61000 ]] || return 1
+    done
+    case "$xhttp_proto" in
+        tcp) [[ "$xhttp_port" != "$tls_tcp" ]] ;;
+        udp) [[ "$xhttp_port" != "$hy2_udp" ]] ;;
+    esac
+}
+
+rn_read_transport_plan() {
+    local -n parsed="$1"
+    local payload="$2" control_port="$3"
+    local -a entries=()
+    mapfile -t entries <<< "$payload"
+    [[ ${#entries[@]} -eq 3 && "${entries[0]}" == TLS_TCP=* && "${entries[2]}" == HY2_UDP=* ]] || return 1
+    local xhttp_proto
+    case "${entries[1]}" in
+        XHTTP_TCP=*) xhttp_proto=tcp ;;
+        XHTTP_UDP=*) xhttp_proto=udp ;;
+        *) return 1 ;;
+    esac
+    local -a values=("${entries[0]#*=}" "${entries[1]#*=}/$xhttp_proto" "${entries[2]#*=}")
+    rn_validate_transport_ports "$control_port" "${values[@]}" || return 1
+    # shellcheck disable=SC2034 # Assignment to the caller via nameref.
+    parsed=("${values[@]}")
+}
+
+rn_format_transport_plan() {
+    local xhttp="$2" xhttp_port="${2%/*}" xhttp_proto=tcp
+    if [[ "$xhttp" == */* ]]; then xhttp_proto="${xhttp##*/}"; fi
+    printf 'TLS_TCP=%s\nXHTTP_%s=%s\nHY2_UDP=%s\n' "$1" "${xhttp_proto^^}" "$xhttp_port" "$3"
+}
+
+rn_check_transport_ports() {
+    local control_port plan listeners failed=0 i
+    local -a saved_ports=() labels=('VLESS+TLS' 'VLESS+xHTTP+TLS' 'Hy2') protos=(tcp tcp udp) ss_flags=(-Hltnp -Hltnp -Hlunp)
+    if [[ ! -r "$RN_APP_DIR/.transport_ports" || ! -r "$RN_APP_DIR/.env" ]]; then
+        printf '%s\n' 'Не сохранены порты трёх транспортов. Проверьте профиль в панели и задайте порты через node-transports.' >&2
+        return 1
+    fi
+    control_port=$(sed -n 's/^NODE_PORT=//p' "$RN_APP_DIR/.env") || return 1
+    plan=$(cat "$RN_APP_DIR/.transport_ports") || return 1
+    if ! rn_read_transport_plan saved_ports "$plan" "$control_port"; then
+        printf '%s\n' 'Некорректная конфигурация .transport_ports.' >&2
+        return 1
+    fi
+    if [[ "${saved_ports[1]}" == */udp ]]; then
+        protos[1]=udp
+        ss_flags[1]=-Hlunp
+    fi
+    saved_ports[1]="${saved_ports[1]%/*}"
+    for i in "${!saved_ports[@]}"; do
+        if ! listeners=$(ss "${ss_flags[i]}" "sport = :${saved_ports[i]}"); then return 1; fi
+        if [[ -z "$listeners" ]]; then
+            printf '%s %s/%s: слушателя нет\n' "${labels[i]}" "${saved_ports[i]}" "${protos[i]}"
+            failed=1
+        elif [[ "$listeners" == *'"rw-core"'* || "$listeners" == *'"xray"'* ]]; then
+            printf '%s %s/%s: слушает Xray\n' "${labels[i]}" "${saved_ports[i]}" "${protos[i]}"
+        else
+            printf '%s %s/%s: порт занят, процесс Xray не подтверждён\n' "${labels[i]}" "${saved_ports[i]}" "${protos[i]}"
+            failed=1
+        fi
+    done
+    return "$failed"
+}
+
+rn_cert_covers_host() {
+    LC_ALL=C openssl x509 -in "$1" -noout -checkhost "$2" 2>/dev/null | grep -F 'does match certificate' >/dev/null
+}
+
+rn_cert_key_matches() {
+    local cert_pub key_pub
+    cert_pub=$(openssl x509 -in "$1" -noout -pubkey 2>/dev/null) || return 1
+    key_pub=$(openssl pkey -in "$2" -passin pass: -pubout 2>/dev/null) || return 1
+    [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]]
 }
 
 # --- Развертывание Docker Compose ---
-rn_deploy_compose() {
+rn_deploy_compose() (
+    umask 077
     local protocol="$1"
     local node_port="$2"
-    local secret_key="$3"
+    local secret_key="$3" domain="${4:-}" template="${5:-status}" requested_alias="${6:-}"
+    local transport_plan="${7:-}"
 
-    mkdir -p "$RN_APP_DIR"
-    cd "$RN_APP_DIR"
+    local stage xray_dir config cert_dir="$RN_CERTS_DIR" live_cert_dir="" nginx_log_dir
+    local cert_path_domain="" cert_path_override="" saved_alias="" candidate=""
+    local bind_type=files
+    local nginx_tls_prefix=/etc/nginx/ssl nginx_tls_cert=snakeoil.pem nginx_tls_key=snakeoil.key
+    local node_cert_volumes="" nginx_cert_volumes=""
+    rn_valid_port "$node_port" && [[ -n "$secret_key" && "$secret_key" != *$'\n'* && "$secret_key" != *$'\r'* ]] || return 1
+    case "$protocol" in reality|xhttp|tls|combined) ;; *) return 1 ;; esac
+    local -a validated_ports=()
+    if [[ "$protocol" == reality ]]; then rn_valid_reality_sni "$RN_DECOY_DOMAIN" || return 1; fi
+    if [[ -n "$domain" ]]; then
+        rn_valid_domain "$domain" || return 1
+        live_cert_dir="/etc/letsencrypt/live/$domain"
+        if [[ -d "$RN_CERTS_DIR/managed/$domain" ]]; then
+            cert_dir="$RN_CERTS_DIR/managed/$domain"
+            bind_type=directory
+        fi
+    fi
+    if [[ -n "$requested_alias" ]]; then
+        if ! rn_valid_cert_path_domain "$domain" "$requested_alias"; then
+            rn_log "${ERROR_T} Укажите имя ноды или её DNS-зону, без URL, Markdown и путей."
+            return 1
+        fi
+        cert_path_override="${requested_alias,,}"
+    elif [[ -r "$RN_APP_DIR/.cert_path_domain" ]]; then
+        IFS= read -r saved_alias < "$RN_APP_DIR/.cert_path_domain" || return 1
+        if rn_valid_cert_path_domain "$domain" "$saved_alias"; then cert_path_override="$saved_alias"; fi
+    fi
+    cert_path_domain="$cert_path_override"
+    if [[ -z "$cert_path_domain" && -r "$cert_dir/.wildcard_zone" ]]; then
+        IFS= read -r candidate < "$cert_dir/.wildcard_zone" || return 1
+        if rn_valid_cert_path_domain "$domain" "$candidate"; then cert_path_domain="$candidate"; fi
+    fi
+    if [[ "$protocol" != reality ]]; then
+        if [[ ! -s "$cert_dir/fullchain.pem" || ! -s "$cert_dir/privkey.pem" ]]; then
+            rn_log "${ERROR_T} Не найдена полная пара сертификата на хосте: $cert_dir/{fullchain.pem,privkey.pem}. Compose не изменён."
+            return 1
+        fi
+        if ! rn_cert_key_matches "$cert_dir/fullchain.pem" "$cert_dir/privkey.pem"; then
+            rn_log "${ERROR_T} Ключ не соответствует сертификату в $cert_dir или файлы повреждены. Compose не изменён."
+            return 1
+        fi
+        if [[ -n "$domain" ]] && ! rn_cert_covers_host "$cert_dir/fullchain.pem" "$domain"; then
+            rn_log "${ERROR_T} Сертификат $cert_dir/fullchain.pem не покрывает $domain. Compose не изменён."
+            return 1
+        fi
+        rn_log "${INFO_T} Сертификат ноды на хосте: $cert_dir/fullchain.pem; ключ: $cert_dir/privkey.pem."
+    fi
+    mkdir -p "$RN_APP_DIR" || return 1
+    [[ -f "$RN_WWW_DIR/index.html" ]] || rn_render_page_template "$template" || return 1
+    cd "$RN_APP_DIR" || return 1
+    exec 9>"$RN_APP_DIR/.deploy.lock" || return 1
+    flock -w 30 9 || return 1
+    if [[ "$protocol" == combined ]]; then
+        if [[ -z "$transport_plan" && -f "$RN_APP_DIR/.transport_ports" ]]; then
+            transport_plan=$(cat "$RN_APP_DIR/.transport_ports") || return 1
+        fi
+        if ! rn_read_transport_plan validated_ports "$transport_plan" "$node_port"; then
+            rn_log "${ERROR_T} Для режима трёх транспортов нужен корректный список портов."
+            return 1
+        fi
+    elif [[ -n "$transport_plan" ]]; then
+        return 1
+    fi
+    stage=$(mktemp -d "$RN_APP_DIR/.deploy.XXXXXXXX") || return 1
+    config="${stage}/docker-compose.yml"
+    trap 'rm -rf -- "$stage"' EXIT
 
-    cat > .env <<EOF
+    if [[ "$RN_XRAY_VERSION_CHOICE" == legacy ]]; then
+        xray_dir="$RN_XRAY_BIN_DIR"
+    elif [[ "$RN_XRAY_VERSION_CHOICE" != built-in ]]; then
+        rn_valid_xray_tag "$RN_XRAY_VERSION_CHOICE" || return 1
+        xray_dir="$RN_XRAY_BIN_DIR/$RN_XRAY_VERSION_CHOICE"
+    fi
+    if [[ -n "${xray_dir:-}" && ! -x "$xray_dir/xray" ]]; then
+        rn_log "${ERROR_T} Кастомный Xray не найден: $xray_dir/xray"
+        return 1
+    fi
+
+    cat > "$stage/.env" <<EOF || return 1
 ### REMNANODE CONFIG ###
 NODE_PORT=$node_port
 SECRET_KEY=$secret_key
 XTLS_API_PORT=61000
 EOF
-    # SECRET_KEY — чувствительные данные: файл не должен быть читаем другими
-    chmod 600 .env
+
+    nginx_log_dir=$(rn_nginx_log_dir) || return 1
+    rn_prepare_log_paths "$nginx_log_dir" || return 1
+    if [[ "$protocol" != reality ]]; then
+        node_cert_volumes=$(rn_cert_volume_lines "$cert_dir" /etc/xray/certs "$bind_type") || return 1
+    fi
+    if [[ -n "$live_cert_dir" && -s "$cert_dir/fullchain.pem" && -s "$cert_dir/privkey.pem" ]]; then
+        nginx_cert_volumes=$(rn_cert_volume_lines "$cert_dir" "$live_cert_dir" "$bind_type") || return 1
+        local tls_live_path="$live_cert_dir" alias_volumes
+        if [[ -n "$cert_path_domain" && "$cert_path_domain" != "$domain" ]]; then
+            tls_live_path="/etc/letsencrypt/live/$cert_path_domain"
+            alias_volumes=$(rn_cert_volume_lines "$cert_dir" "$tls_live_path" "$bind_type") || return 1
+            nginx_cert_volumes+=$'\n'"$alias_volumes"
+        fi
+        if [[ -n "$node_cert_volumes" ]]; then node_cert_volumes+=$'\n'; fi
+        node_cert_volumes+="$nginx_cert_volumes"
+        rn_log "${INFO_T} Путь к сертификату в контейнере: $tls_live_path/fullchain.pem."
+        if [[ "$protocol" == reality ]] && rn_cert_covers_host "$cert_dir/fullchain.pem" "$RN_DECOY_DOMAIN" &&
+            rn_cert_key_matches "$cert_dir/fullchain.pem" "$cert_dir/privkey.pem"; then
+            nginx_tls_prefix="$tls_live_path"
+            nginx_tls_cert=fullchain.pem
+            nginx_tls_key=privkey.pem
+        fi
+    fi
 
     local snakeoil_cert="$RN_CERTS_DIR/snakeoil.pem"
     local snakeoil_key="$RN_CERTS_DIR/snakeoil.key"
-    if [ ! -f "$snakeoil_cert" ]; then
-        mkdir -p "$RN_CERTS_DIR"
+    if [[ "$protocol" == reality && "$nginx_tls_cert" == snakeoil.pem ]] && { [[ ! -s "$snakeoil_cert" || ! -s "$snakeoil_key" ]]; }; then
+        mkdir -p "$RN_CERTS_DIR" || return 1
         openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
             -keyout "$snakeoil_key" \
             -out "$snakeoil_cert" \
-            -subj "/CN=localhost" >> "$RN_LOG_FILE" 2>&1
-        chmod 600 "$snakeoil_key" "$snakeoil_cert"
+            -subj "/CN=localhost" >> "$RN_LOG_FILE" 2>&1 || return 1
+        chmod 600 "$snakeoil_key" "$snakeoil_cert" || return 1
     fi
 
-    cat > docker-compose.yml <<EOF
+    if [[ "$protocol" == reality && "$nginx_tls_cert" == snakeoil.pem ]]; then
+        if [[ -n "$nginx_cert_volumes" ]]; then nginx_cert_volumes+=$'\n'; fi
+        printf -v nginx_cert_volumes '%s      - %s:%s/snakeoil.pem:ro\n      - %s:%s/snakeoil.key:ro' "$nginx_cert_volumes" "$snakeoil_cert" "$nginx_tls_prefix" "$snakeoil_key" "$nginx_tls_prefix"
+    fi
+
+    cat > "$config" <<EOF || return 1
 services:
   remnanode:
     image: ghcr.io/remnawave/node:latest
@@ -1182,16 +1410,22 @@ services:
       - NET_ADMIN
     env_file:
       - .env
+    logging:
+      driver: local
+      options:
+        max-size: "20m"
+        max-file: "5"
     volumes:
       - /dev/shm:/dev/shm:rw
-      - $RN_LOG_DIR/node:/var/log/supervisor
-$( [ "$protocol" = "tls" ] || [ "$protocol" = "xhttp" ] && echo "      - $RN_CERTS_DIR:/etc/xray/certs:ro" )
-$( [ "$RN_XRAY_VERSION_CHOICE" != "built-in" ] && echo "      - $RN_XRAY_FILE:/usr/local/bin/xray" )
-$( [ "$RN_XRAY_VERSION_CHOICE" != "built-in" ] && [ -f "$RN_XRAY_BIN_DIR/geoip.dat" ] && echo "      - $RN_XRAY_BIN_DIR/geoip.dat:/usr/local/share/xray/geoip.dat" )
-$( [ "$RN_XRAY_VERSION_CHOICE" != "built-in" ] && [ -f "$RN_XRAY_BIN_DIR/geosite.dat" ] && echo "      - $RN_XRAY_BIN_DIR/geosite.dat:/usr/local/share/xray/geosite.dat" )
+      - $RN_LOG_DIR:/var/log/remnanode
+      - $RN_LOG_DIR/xray:/var/log/xray
+$node_cert_volumes
+$( [[ -n "${xray_dir:-}" ]] && echo "      - $xray_dir/xray:/usr/local/bin/xray:ro" )
+$( [[ -n "${xray_dir:-}" && -f "$xray_dir/geoip.dat" ]] && echo "      - $xray_dir/geoip.dat:/usr/local/share/xray/geoip.dat:ro" )
+$( [[ -n "${xray_dir:-}" && -f "$xray_dir/geosite.dat" ]] && echo "      - $xray_dir/geosite.dat:/usr/local/share/xray/geosite.dat:ro" )
 
   remnawave-nginx:
-    image: nginx:1.28
+    image: nginx:1.31
     container_name: remnawave-nginx
     hostname: remnawave-nginx
     restart: always
@@ -1200,14 +1434,13 @@ $( [ "$RN_XRAY_VERSION_CHOICE" != "built-in" ] && [ -f "$RN_XRAY_BIN_DIR/geosite
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - /dev/shm:/dev/shm:rw
       - $RN_WWW_DIR:/var/www/html:ro
-      - $RN_LOG_DIR/nginx:/var/log/nginx
-      - $RN_CERTS_DIR/snakeoil.pem:/etc/nginx/ssl/snakeoil.pem:ro
-      - $RN_CERTS_DIR/snakeoil.key:/etc/nginx/ssl/snakeoil.key:ro
+      - $nginx_log_dir:/var/log/nginx
+$nginx_cert_volumes
     command: sh -c 'rm -f /dev/shm/nginx.sock && exec nginx -g "daemon off;"'
 EOF
 
     if [ "$protocol" = "reality" ]; then
-        cat > nginx.conf <<EOF
+        cat > "$stage/nginx.conf" <<EOF || return 1
 server {
     listen unix:/dev/shm/nginx.sock ssl proxy_protocol default_server;
     server_name _;
@@ -1217,11 +1450,13 @@ server {
 server {
     listen unix:/dev/shm/nginx.sock ssl proxy_protocol;
     server_name $RN_DECOY_DOMAIN;
-    ssl_certificate "/etc/nginx/ssl/snakeoil.pem";
-    ssl_certificate_key "/etc/nginx/ssl/snakeoil.key";
+    ssl_certificate "$nginx_tls_prefix/$nginx_tls_cert";
+    ssl_certificate_key "$nginx_tls_prefix/$nginx_tls_key";
 
     root /var/www/html;
     index index.html;
+    access_log /var/log/nginx/access.log;
+    error_log /var/log/nginx/error.log warn;
     add_header X-Robots-Tag "noindex, nofollow, noarchive, nosnippet" always;
 
     location / {
@@ -1230,13 +1465,15 @@ server {
 }
 EOF
     else
-        cat > nginx.conf <<EOF
+        cat > "$stage/nginx.conf" <<EOF || return 1
 server {
     listen unix:/dev/shm/nginx.sock proxy_protocol default_server;
     server_name _;
 
     root /var/www/html;
     index index.html;
+    access_log /var/log/nginx/access.log;
+    error_log /var/log/nginx/error.log warn;
     add_header X-Robots-Tag "noindex, nofollow, noarchive, nosnippet" always;
 
     location / {
@@ -1246,71 +1483,376 @@ server {
 EOF
     fi
 
-    rn_log "${INFO_T} Запуск контейнеров Docker..."
-    docker compose down &>/dev/null || true
-    if docker compose up -d >> "$RN_LOG_FILE" 2>&1; then
-        rn_log "${SUCCESS_T} Контейнеры успешно развернуты и запущены!"
-    else
-        rn_log "${ERROR_T} Ошибка запуска контейнеров! Проверьте логи: $RN_LOG_FILE"
+    local hash file rc=0 rollback_rc=0
+    hash=$(sha256sum "$stage/nginx.conf") || return 1
+    sed -i "/^    container_name: remnawave-nginx$/a\\    labels: { io.safe-remnanode.nginx-config: \"${hash%% *}\" }" "$config" || return 1
+    # Stage relative paths independently; keep the live files untouched until the check passes.
+    docker compose --project-directory "$stage" --env-file "$stage/.env" -f "$config" config --quiet >> "$RN_LOG_FILE" 2>&1 || {
+        rn_log "${ERROR_T} Проверка новой Compose-конфигурации не прошла. Старая не изменена."
         return 1
+    }
+    rn_setup_logging_and_rotation "$nginx_log_dir" || return 1
+    mkdir "$stage/previous" || return 1
+    local -a files=(.env nginx.conf docker-compose.yml .xray_version .decoy_domain .protocol .cert_path_domain)
+    printf '%s\n' "$cert_path_override" > "$stage/.cert_path_domain" || return 1
+    printf '%s\n' "$protocol" > "$stage/.protocol" || return 1
+    if [[ "$protocol" == combined ]]; then
+        rn_format_transport_plan "${validated_ports[@]}" > "$stage/.transport_ports" || return 1
+        files+=(.transport_ports)
+    fi
+    if [[ -n "$domain" ]]; then
+        printf '%s\n' "$domain" > "$stage/.node_domain" || return 1
+        files+=(.node_domain)
+    fi
+    printf '%s\n' "$RN_XRAY_VERSION_CHOICE" > "$stage/.xray_version" || return 1
+    printf '%s\n' "$RN_DECOY_DOMAIN" > "$stage/.decoy_domain" || return 1
+    for file in "${files[@]}"; do
+        if [[ -f "$file" ]]; then cp -p -- "$file" "$stage/previous/$file" || return 1; fi
+    done
+    for file in "${files[@]}"; do
+        if [[ -f "$file" ]] && cmp -s -- "$stage/$file" "$file"; then continue; fi
+        mv -fT -- "$stage/$file" "$file" || { rc=1; break; }
+    done
+    if (( rc == 0 )) && chmod 0600 .env && docker compose up -d --wait --wait-timeout 60 >> "$RN_LOG_FILE" 2>&1; then
+        rn_log "${SUCCESS_T} Compose запущен; выполнены доступные healthcheck."
+        return 0
+    fi
+    rn_log "${ERROR_T} Новая ревизия не запущена. Восстанавливаю предыдущие конфиги."
+    if [[ ! -f "$stage/previous/docker-compose.yml" && -f docker-compose.yml ]]; then
+        docker compose down >> "$RN_LOG_FILE" 2>&1 || rollback_rc=1
+    fi
+    for file in "${files[@]}"; do
+        if [[ -f "$stage/previous/$file" ]]; then
+            if ! cmp -s -- "$stage/previous/$file" "$file"; then
+                cp -p -- "$stage/previous/$file" "$stage/$file.restore" &&
+                    mv -fT -- "$stage/$file.restore" "$file" || rollback_rc=1
+            fi
+        else
+            rm -f -- "$file" || rollback_rc=1
+        fi
+    done
+    if [[ -f "$stage/previous/docker-compose.yml" ]]; then
+        docker compose up -d --wait --wait-timeout 60 >> "$RN_LOG_FILE" 2>&1 || rollback_rc=1
+    fi
+    if (( rollback_rc )); then
+        trap - EXIT
+        rn_log "${ERROR_T} Откат неполный; резервные копии: $stage/previous"
+    fi
+    return 1
+)
+
+rn_load_node_state() {
+    RN_XRAY_VERSION_CHOICE=built-in
+    RN_DECOY_DOMAIN=github.com
+    if [[ -f "$RN_APP_DIR/.xray_version" ]]; then
+        IFS= read -r RN_XRAY_VERSION_CHOICE < "$RN_APP_DIR/.xray_version" || return 1
+    elif [[ -f "$RN_APP_DIR/docker-compose.yml" ]] && grep -q '/bin/xray:/usr/local/bin/xray' "$RN_APP_DIR/docker-compose.yml"; then
+        RN_XRAY_VERSION_CHOICE=legacy
+    fi
+    if [[ -f "$RN_APP_DIR/.decoy_domain" ]]; then
+        IFS= read -r RN_DECOY_DOMAIN < "$RN_APP_DIR/.decoy_domain" || return 1
+    elif [[ -f "$RN_APP_DIR/nginx.conf" ]]; then
+        local existing
+        existing=$(awk '$1 == "server_name" && $2 != "_;" {sub(/;$/, "", $2); print $2; exit}' "$RN_APP_DIR/nginx.conf") || return 1
+        if rn_valid_domain "$existing"; then RN_DECOY_DOMAIN="$existing"; fi
     fi
 }
 
 # --- Фаервол (UFW) для ноды ---
-rn_configure_firewall() {
-    local node_port="$1"
-    local panel_ip="$2"
+rn_check_ufw_ready() {
+    local status
+    if ! command -v ufw >/dev/null; then
+        rn_log "${ERROR_T} UFW не установлен. Установите пакет ufw и настройте доступ SSH до включения firewall."
+        return 1
+    fi
+    if ! status=$(LC_ALL=C ufw status verbose 2>>"$RN_LOG_FILE"); then
+        rn_log "${ERROR_T} Не удалось прочитать статус UFW. Проверьте sudo ufw status verbose и журнал: $RN_LOG_FILE"
+        return 1
+    fi
+    rn_require_active_ufw "$status"
+}
 
-    rn_log "${INFO_T} Настройка брандмауэра UFW..."
+rn_require_active_ufw() {
+    local status="$1"
+    if [[ "$status" != 'Status: active'* ]]; then
+        rn_log "${ERROR_T} UFW не активен. Правила не менялись."
+        rn_log "${INFO_T} Перед включением UFW разрешите фактический TCP-порт SSH, проверьте имеющиеся правила и доступ через консоль VPS. Затем повторите установку."
+        return 1
+    fi
+    if [[ "$status" != *'Default: deny (incoming)'* && "$status" != *'Default: reject (incoming)'* ]]; then
+        rn_log "${ERROR_T} UFW не запрещает входящие подключения по умолчанию. Проверьте доступ SSH и настройте политику вручную. Правила не менялись."
+        return 1
+    fi
+}
 
-    ufw default deny incoming >> "$RN_LOG_FILE" 2>&1 || true
-    ufw default allow outgoing >> "$RN_LOG_FILE" 2>&1 || true
+# Use the server-side port of the current SSH session, or a unique sshd listener.
+# sudo may strip SSH_CONNECTION; never fall back to port 22 by guesswork.
+rn_ssh_port_for_ufw() {
+    local listeners local_address port line from_ip remote_port to_ip session_port extra choice
+    local -A listening=() ssh_ports=()
+    if ! listeners=$(LC_ALL=C ss -Hltnp 2>>"$RN_LOG_FILE"); then
+        printf '%s\n' 'Не удалось прочитать TCP-слушатели (ss из iproute2). UFW не будет включён.' >&2
+        return 1
+    fi
+    while IFS= read -r line; do
+        local_address=$(awk '{print $4}' <<< "$line")
+        case "$local_address" in 127.*|\[::1\]:*) continue ;; esac
+        port="${local_address##*:}"
+        rn_valid_port "$port" || continue
+        listening[$port]=1
+        case "$line" in
+            *'("sshd",'*|*'("sshd-session",'*|*'("dropbear",'*) ssh_ports[$port]=1 ;;
+        esac
+    done <<< "$listeners"
+    IFS=' ' read -r from_ip remote_port to_ip session_port extra <<< "${SSH_CONNECTION:-}"
+    if [[ -n "$from_ip" && -n "$to_ip" && -z "$extra" ]] && rn_valid_port "$remote_port" &&
+        rn_valid_port "$session_port" && [[ -n "${listening[$session_port]:-}" ]]; then
+        printf '%s\n' "$session_port"
+        return 0
+    fi
+    if (( ${#ssh_ports[@]} == 1 )); then
+        printf '%s\n' "${!ssh_ports[@]}"
+        return 0
+    fi
+    printf '%s' 'Не удалось однозначно определить порт SSH. Укажите фактический TCP-порт SSH или нажмите Enter для отмены: ' >&2
+    if IFS= read -r choice && rn_valid_port "$choice" && [[ -n "${listening[$choice]:-}" ]]; then
+        printf '%s\n' "$choice"
+        return 0
+    fi
+    printf '\n%s\n' 'Порт SSH не подтверждён. UFW не будет включён. Проверьте SSH через консоль VPS.' >&2
+    return 1
+}
 
-    local ssh_port=22
-    if command -v ss &>/dev/null; then
-        local detected_port; detected_port=$(ss -tlnp 2>/dev/null | grep sshd | awk '{print $4}' | grep -oE '[0-9]+$' | head -n 1)
-        if [ -n "$detected_port" ]; then
-            ssh_port="$detected_port"
+# Parse just the requested setting; never source firewall configuration.
+rn_ufw_default() {
+    awk -F= -v key="$1" '
+        NF == 2 {
+            k=$1; gsub(/[[:space:]]/, "", k)
+            if (k == key) { v=$2; sub(/#.*/, "", v); gsub(/[[:space:]"\047]/, "", v); result=v }
+        }
+        END { print result }
+    ' "$RN_UFW_DEFAULTS_FILE"
+}
+
+rn_prepare_ufw_initial() {
+    local status='Status: inactive' ssh_port defaults saved_rules
+    if [[ -e "$RN_APP_DIR/docker-compose.yml" ]]; then
+        rn_check_ufw_ready
+        return $?
+    fi
+    if command -v ufw >/dev/null; then
+        status=$(LC_ALL=C ufw status verbose 2>>"$RN_LOG_FILE") || {
+            rn_log "${ERROR_T} Не удалось прочитать статус UFW. Правила не менялись."
+            return 1
+        }
+    fi
+    if [[ "$status" != 'Status: inactive'* ]]; then
+        rn_require_active_ufw "$status"
+        return $?
+    fi
+
+    ssh_port=$(rn_ssh_port_for_ufw) || return 1
+    if ! command -v ufw >/dev/null; then
+        rn_log "${INFO_T} Устанавливаю UFW перед настройкой ноды."
+        apt_update && apt_install ufw || return 1
+        status=$(LC_ALL=C ufw status verbose 2>>"$RN_LOG_FILE") || return 1
+        if [[ "$status" != 'Status: inactive'* ]]; then
+            rn_require_active_ufw "$status"
+            return $?
         fi
     fi
-    rn_log "${INFO_T} Разрешаем активный порт SSH: ${CYAN}$ssh_port${NC}"
-    ufw allow "$ssh_port"/tcp comment 'SSH Port' >> "$RN_LOG_FILE" 2>&1 || true
-
-    rn_log "${INFO_T} Разрешаем порты HTTP (80) и HTTPS (443) для Xray/Nginx..."
-    {
-        ufw allow 80/tcp comment 'HTTP / Certbot'
-        ufw allow 443/tcp comment 'Xray Incoming TCP'
-        ufw allow 443/udp comment 'Xray Incoming UDP'
-    } >> "$RN_LOG_FILE" 2>&1 || true
-
-    if [ -f "$RN_APP_DIR/.xray_ports" ]; then
-        local custom_ports; custom_ports=$(tr '\n' ' ' < "$RN_APP_DIR/.xray_ports" | xargs)
-        local port
-        for port in $custom_ports; do
-            if [ -n "$port" ]; then
-                rn_log "${INFO_T} Открытие в UFW кастомного порта Xray: ${CYAN}$port${NC}"
-                {
-                    ufw allow "$port"/tcp comment 'Xray Custom Port TCP'
-                    ufw allow "$port"/udp comment 'Xray Custom Port UDP'
-                } >> "$RN_LOG_FILE" 2>&1 || true
-            fi
-        done
+    defaults=$(rn_ufw_default DEFAULT_INPUT_POLICY 2>>"$RN_LOG_FILE") || return 1
+    case "$defaults" in
+        DROP|REJECT) ;;
+        *) rn_log "${ERROR_T} UFW не включён: сначала проверьте политику входящих (нужен DROP или REJECT)."; return 1 ;;
+    esac
+    local current_ssh="${SSH_CONNECTION:-}" ipv6 ipv6_listeners=""
+    ipv6=$(rn_ufw_default IPV6 2>>"$RN_LOG_FILE") || return 1
+    if [[ "$ipv6" != yes ]]; then
+        if [[ -z "$current_ssh" ]]; then
+            ipv6_listeners=$(LC_ALL=C ss -H -ltn -6 "sport = :$ssh_port" 2>>"$RN_LOG_FILE") || return 1
+        fi
+        if [[ "${current_ssh%% *}" == *:* || -n "$ipv6_listeners" ]]; then
+            rn_log "${ERROR_T} UFW не включён: SSH может использовать IPv6, а его поддержка в UFW не подтверждена. Используйте консоль VPS."
+            return 1
+        fi
     fi
-
-    rn_log "${INFO_T} Ограничиваем порт управления ${CYAN}$node_port${NC} только для IP панели: ${GREEN}$panel_ip${NC}"
-    {
-        ufw allow from "$panel_ip" to any port "$node_port" proto tcp comment 'Remnanode Control from Panel'
-        ufw --force enable
-        ufw reload
-    } >> "$RN_LOG_FILE" 2>&1 || true
-
-    rn_log "${SUCCESS_T} Брандмауэр UFW успешно настроен!"
+    saved_rules=$(LC_ALL=C ufw show added 2>>"$RN_LOG_FILE") || return 1
+    if grep -Eq '^ufw (deny|reject|limit)( |$)' <<< "$saved_rules"; then
+        rn_log "${ERROR_T} UFW не включён: уже есть правила deny/reject/limit, которые могут влиять на SSH. Проверьте их вручную через консоль VPS."
+        return 1
+    fi
+    rn_log "${INFO_T} UFW неактивен: разрешаю SSH ($ssh_port/tcp) перед включением."
+    if ! LC_ALL=C ufw prepend allow "$ssh_port/tcp" comment 'SSH (initial setup)' >> "$RN_LOG_FILE" 2>&1; then
+        rn_log "${ERROR_T} Не удалось добавить правило SSH. UFW не включён; см. $RN_LOG_FILE."
+        return 1
+    fi
+    saved_rules=$(LC_ALL=C ufw show added 2>>"$RN_LOG_FILE") || return 1
+    if ! grep -Eq "^ufw allow $ssh_port/tcp( |$)" <<< "$saved_rules"; then
+        rn_log "${ERROR_T} Правило SSH не найдено среди сохранённых правил. UFW не включён."
+        return 1
+    fi
+    if ! LC_ALL=C ufw --force enable >> "$RN_LOG_FILE" 2>&1; then
+        rn_log "${ERROR_T} Не удалось включить UFW. Правило SSH могло сохраниться; проверьте состояние и $RN_LOG_FILE."
+        return 1
+    fi
+    rn_check_ufw_ready || return 1
+    rn_log "${SUCCESS_T} UFW активен. Прежде чем закрывать текущую SSH-сессию, проверьте вход во второй."
 }
+
+rn_ufw_allow() {
+    local preview line unchanged=0
+    if ! preview=$(LC_ALL=C ufw --dry-run allow "$@" 2>>"$RN_LOG_FILE"); then
+        rn_log "${ERROR_T} Не удалось проверить правило UFW. См. $RN_LOG_FILE."
+        return 1
+    fi
+    # Ask UFW itself, since a public rule may exist for only one address family.
+    while IFS= read -r line; do
+        case "$line" in
+            '') ;;
+            'Skipping adding existing rule'|'Skipping adding existing rule (v6)') unchanged=1 ;;
+            *) unchanged=0; break ;;
+        esac
+    done <<< "$preview"
+    if (( unchanged )); then return 0; fi
+    if ! ufw allow "$@" >> "$RN_LOG_FILE" 2>&1; then
+        rn_log "${ERROR_T} Ошибка добавления правила UFW. Предыдущие успешные правила могли сохраниться; проверьте sudo ufw status verbose и $RN_LOG_FILE."
+        return 1
+    fi
+}
+
+rn_normalize_port_range() {
+    if [[ "$1" == *:* && "${1%%:*}" == "${1##*:}" ]]; then
+        printf '%s\n' "${1%%:*}"
+    else
+        printf '%s\n' "$1"
+    fi
+}
+
+rn_collect_custom_ports() {
+    local node_port="$1" entry port
+    local -n result_ports="$2"
+    local -A seen_ports=()
+    result_ports=()
+    [[ -f "$RN_APP_DIR/.xray_ports" ]] || return 0
+    while IFS= read -r entry || [[ -n "$entry" ]]; do
+        [[ -n "$entry" ]] || continue
+        if ! rn_public_range_ok "$node_port" "$entry"; then
+            rn_log "${ERROR_T} Некорректная запись или пересечение с портом управления в .xray_ports: $entry"
+            return 1
+        fi
+        port=$(rn_normalize_port_range "$entry") || return 1
+        [[ "$port" != 443 && -z "${seen_ports[$port]:-}" ]] || continue
+        seen_ports[$port]=1
+        result_ports+=("$port")
+    done < "$RN_APP_DIR/.xray_ports"
+}
+
+rn_store_custom_ports() (
+    local path="$RN_APP_DIR/.xray_ports" tmp
+    if [[ ! -f "$path" && $# -eq 0 ]]; then return 0; fi
+    tmp=$(mktemp "$RN_APP_DIR/.xray-ports.XXXXXXXX") || return 1
+    trap 'rm -f -- "$tmp"' EXIT
+    if (( $# )); then printf '%s\n' "$@" > "$tmp" || return 1; fi
+    if [[ -f "$path" ]] && cmp -s -- "$tmp" "$path"; then return 0; fi
+    mv -fT -- "$tmp" "$path"
+)
+
+rn_allow_custom_port() {
+    local port="$1"
+    if [[ "$port" == 443 ]]; then return 0; fi
+    if [[ "$port" != 80 ]]; then
+        rn_ufw_allow "$port"/tcp comment 'Xray Custom Port TCP' || return 1
+    fi
+    rn_ufw_allow "$port"/udp comment 'Xray Custom Port UDP'
+}
+
+rn_delete_custom_port() {
+    local port
+    port=$(rn_normalize_port_range "$1") || return 1
+    if [[ "$port" == 443 ]]; then return 0; fi
+    if [[ "$port" != 80 ]]; then
+        ufw delete allow "$port"/tcp >> "$RN_LOG_FILE" 2>&1 || return 1
+    fi
+    ufw delete allow "$port"/udp >> "$RN_LOG_FILE" 2>&1
+}
+
+rn_configure_firewall() {
+    local node_port="$1" panel_ip="$2" entry port
+    shift 2
+    rn_valid_port "$node_port" && rn_valid_ipv4 "$panel_ip" || return 1
+    rn_public_range_ok "$node_port" 80 && rn_public_range_ok "$node_port" 443 || return 1
+    local -a custom_ports=()
+    local -A seen_ports=()
+    rn_collect_custom_ports "$node_port" custom_ports || return 1
+    for port in "${custom_ports[@]}"; do seen_ports[$port]=1; done
+    for entry in "$@"; do
+        rn_public_range_ok "$node_port" "$entry" || return 1
+        port=$(rn_normalize_port_range "$entry") || return 1
+        [[ "$port" != 443 && -z "${seen_ports[$port]:-}" ]] || continue
+        seen_ports[$port]=1
+        custom_ports+=("$port")
+    done
+    rn_check_ufw_ready || return 1
+    # Respect the administrator's firewall policy; never change defaults or enable it here.
+    rn_ufw_allow from "$panel_ip" to any port "$node_port" proto tcp comment 'Remnanode Control from Panel' || return 1
+    rn_ufw_allow 80/tcp comment 'HTTP / Certbot' || return 1
+    rn_ufw_allow 443/tcp comment 'Xray Incoming TCP' || return 1
+    rn_ufw_allow 443/udp comment 'Xray Incoming UDP' || return 1
+    for port in "${custom_ports[@]}"; do rn_allow_custom_port "$port" || return 1; done
+    rn_store_custom_ports "${custom_ports[@]}" || return 1
+    rn_log "${SUCCESS_T} Правила ноды проверены. Добавлены только отсутствующие или требующие обновления."
+}
+
+rn_configure_combined_firewall() {
+    local control_port="$1" panel_ip="$2" tls_tcp="$3" xhttp="$4" hy2_udp="$5"
+    if ! rn_valid_ipv4 "$panel_ip" || ! rn_validate_transport_ports "$control_port" "$tls_tcp" "$xhttp" "$hy2_udp"; then
+        rn_log "${ERROR_T} Некорректные порты или конфликт портов одного протокола. Порт управления и 61000 зарезервированы."
+        return 1
+    fi
+    if [[ "$xhttp" != */* ]]; then xhttp+=/tcp; fi
+    local xhttp_proto="${xhttp##*/}"
+    rn_check_ufw_ready || return 1
+    rn_ufw_allow from "$panel_ip" to any port "$control_port" proto tcp comment 'Remnanode Control from Panel' || return 1
+    rn_ufw_allow "$tls_tcp/tcp" comment 'VLESS TLS TCP' || return 1
+    rn_ufw_allow "$xhttp" comment "VLESS xHTTP TLS ${xhttp_proto^^}" || return 1
+    rn_ufw_allow "$hy2_udp/udp" comment 'Hysteria2 UDP' || return 1
+    rn_log "${SUCCESS_T} Проверены правила для $tls_tcp/tcp, $xhttp, $hy2_udp/udp. Старые правила не удалены."
+}
+
+rn_set_existing_transport_ports() (
+    if (( $# != 3 )); then
+        printf '%s\n' 'Использование: node-transports <VLESS-TLS TCP> <xHTTP port[/tcp|/udp]> <Hy2 UDP>' >&2
+        return 1
+    fi
+    local control_port panel_ip planned
+    if [[ ! -d "$RN_APP_DIR" ]]; then
+        rn_log "${ERROR_T} Не найден управляемый деплой."
+        return 1
+    fi
+    exec 9>"$RN_APP_DIR/.deploy.lock" || return 1
+    flock -w 30 9 || return 1
+    if [[ ! -f "$RN_APP_DIR/docker-compose.yml" || ! -f "$RN_APP_DIR/.env" || ! -f "$RN_APP_DIR/.panel_ip" ]]; then
+        rn_log "${ERROR_T} Не найден управляемый деплой или IP панели."
+        return 1
+    fi
+    control_port=$(sed -n 's/^NODE_PORT=//p' "$RN_APP_DIR/.env") || return 1
+    IFS= read -r panel_ip < "$RN_APP_DIR/.panel_ip" || return 1
+    planned=$(mktemp "$RN_APP_DIR/.transport-ports.XXXXXXXX") || return 1
+    trap 'rm -f -- "$planned"' EXIT
+    rn_format_transport_plan "$@" > "$planned" || return 1
+    rn_configure_combined_firewall "$control_port" "$panel_ip" "$@" || return 1
+    if ! cmp -s -- "$planned" "$RN_APP_DIR/.transport_ports"; then
+        mv -fT -- "$planned" "$RN_APP_DIR/.transport_ports" || return 1
+    fi
+    rn_log "${SUCCESS_T} Список портов сохранён. Compose, nginx и конфигурация панели не изменены; контейнеры не перезапущены."
+)
 
 # --- Первоначальная установка ноды (полный интерактивный флоу) ---
 rn_initial_setup() {
     cls
     rn_log "${INFO_T} Запуск первоначальной настройки и установки ноды..."
+    rn_prepare_ufw_initial || return 1
 
     if [ -f "$RN_APP_DIR/docker-compose.yml" ]; then
         echo -e "${WARNING_T} Нода уже установлена. Повторная установка ПЕРЕЗАПИШЕТ"
@@ -1319,13 +1861,13 @@ rn_initial_setup() {
         [[ "${reinstall:-n}" =~ ^[Yy]$ ]] || { echo -e "${YELLOW}Отменено.${NC}"; return; }
     fi
 
-    mkdir -p "$RN_APP_DIR"
-    rm -f "$RN_APP_DIR/.xray_ports"
+    mkdir -p "$RN_APP_DIR" || return 1
+    rn_load_node_state || return 1
 
     echo ""
     echo -e "${BLUE}⚙️  ЭТАП 1: СЕТЕВАЯ ОПТИМИЗАЦИЯ И ЗАВИСИМОСТИ${NC}"
-    read -r -p "Применить сетевую оптимизацию (BBR + sysctl профиль по ОЗУ)? [Y/n]: " do_opt; do_opt=${do_opt:-Y}
-    if [[ $do_opt =~ ^[Yy] ]]; then rn_optimize_network; fi
+    read -r -p "Применить сетевую оптимизацию (BBR + sysctl профиль по ОЗУ)? [y/N]: " do_opt; do_opt=${do_opt:-N}
+    if [[ $do_opt =~ ^[Yy] ]]; then rn_optimize_network || return 1; fi
     if ! rn_install_dependencies; then
         rn_log "${ERROR_T} Установка зависимостей не удалась — установка ноды прервана."
         pause_prompt
@@ -1334,32 +1876,42 @@ rn_initial_setup() {
 
     echo ""
     echo -e "${BLUE}⚙️  ЭТАП 2: ВЕРСИЯ XRAY-CORE${NC}"
-    read -r -p "Выбрать версию Xray-Core (список с GitHub)? [Y/n]: " do_xray; do_xray=${do_xray:-Y}
-    if [[ $do_xray =~ ^[Yy] ]]; then rn_select_xray_version; fi
-
-    rn_setup_logging_and_rotation
+    rn_prepare_latest_xray || return 1
 
     echo -e "\n${BLUE}🔌 НАСТРОЙКА ИДЕНТИФИКАЦИИ И СВЯЗИ С ПАНЕЛЬЮ${NC}"
     echo -e "${GRAY}--------------------------------------------------${NC}"
 
-    read -r -p "Введите IP адрес панели Remnawave (для настройки UFW): " panel_ip
-    while [[ ! "$panel_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; do
-        read -r -p "${RED}Неверный формат IP. Введите корректный IPv4 панели: ${NC}" panel_ip
+    read -r -p "Введите IP адрес панели Remnawave (для настройки UFW): " panel_ip || return 1
+    while ! rn_valid_ipv4 "$panel_ip"; do
+        read -r -p "${RED}Неверный формат IP. Введите корректный IPv4 панели: ${NC}" panel_ip || return 1
     done
 
     read -r -p "Введите домен вашей ноды (например, node.example.com): " node_domain
-    while [ -z "$node_domain" ]; do
-        read -r -p "${RED}Домен ноды не может быть пустым: ${NC}" node_domain
+    while ! rn_valid_domain "$node_domain"; do
+        read -r -p "${RED}Введите корректное DNS-имя ноды: ${NC}" node_domain || return 1
     done
     RN_NODE_DOMAIN="$node_domain"
 
     read -r -p "Порт управления нодой (для панели) [2222]: " node_port
     node_port=${node_port:-2222}
+    if ! rn_public_range_ok "$node_port" 80 || ! rn_public_range_ok "$node_port" 443; then
+        rn_log "${ERROR_T} Некорректный или зарезервированный порт управления."
+        return 1
+    fi
 
+    if [[ -f "$RN_APP_DIR/docker-compose.yml" ]]; then
+        local previous_port previous_ip
+        previous_port=$(sed -n 's/^NODE_PORT=//p' "$RN_APP_DIR/.env") || return 1
+        IFS= read -r previous_ip < "$RN_APP_DIR/.panel_ip" || return 1
+        if [[ "$node_port" != "$previous_port" || "$panel_ip" != "$previous_ip" ]]; then
+            rn_log "${ERROR_T} При переустановке порт и IP панели должны совпадать с текущими. Для смены IP используйте отдельный пункт меню."
+            return 1
+        fi
+    fi
     echo -e "\n${YELLOW}Вставьте сертификат ноды (secret key), выданный в панели Remnawave${NC}"
     echo -e "${GRAY}(Для окончания ввода нажмите Enter дважды подряд):${NC}"
     local certificate=""
-    while IFS= read -r line; do
+    while IFS= read -rs line; do
         if [ -z "$line" ]; then
             if [ -n "$certificate" ]; then
                 break
@@ -1369,59 +1921,72 @@ rn_initial_setup() {
         fi
     done
 
-    local secret_key_value; secret_key_value=$(echo -e "$certificate" | xargs)
+    printf '\n'
+    local secret_key_value; secret_key_value=$(printf '%b' "$certificate" | xargs) || return 1
     while [ -z "$secret_key_value" ]; do
         rn_log "${ERROR_T} Сертификат не может быть пустым!"
         return 1
     done
 
-    echo -e "\n${BLUE}⚙️  ВХОДЯЩИЕ ПОРТЫ ДЛЯ КЛИЕНТОВ XRAY${NC}"
-    echo -e "По умолчанию порты 80 и 443 будут открыты автоматически."
-    read -r -p "Желаете открыть дополнительные входящие порты для Xray в UFW? (через пробел, например: 8443 2053) [Нет]: " add_ports_choice
-    add_ports_choice=${add_ports_choice:-""}
-    if [ -n "$add_ports_choice" ]; then
-        local clean_ports; clean_ports=$(echo "$add_ports_choice" | tr ',' ' ' | xargs)
-        local p
-        for p in $clean_ports; do
-            if [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ]; then
-                echo "$p" >> "$RN_APP_DIR/.xray_ports"
-                rn_log "${SUCCESS_T} Порт $p добавлен в список автооткрытия."
+    echo -e "\nВыберите конфигурацию ноды:"
+    echo " 1) VLESS-Reality (с выбором SNI)"
+    echo " 2) VLESS+TLS"
+    echo " 3) VLESS+xHTTP+TLS"
+    echo " 4) VLESS+TLS + VLESS+xHTTP+TLS + Hy2 одновременно"
+    read -r -p "Ваш выбор [1]: " proto_choice || return 1
+    local protocol transport_plan=""
+    local -a new_public_ports=()
+    local entry vless_tls_tcp vless_xhttp hy2_udp
+    case "${proto_choice:-1}" in
+        1) protocol=reality; rn_prompt_reality_sni || return 1 ;;
+        2) protocol=tls ;;
+        3) protocol=xhttp ;;
+        4) protocol=combined ;;
+        *) rn_log "${ERROR_T} Неизвестный вариант конфигурации."; return 1 ;;
+    esac
+    if [[ "$protocol" == combined ]]; then
+        printf '%s\n' 'Укажите порты из панели Remnawave. Установщик не создаёт и не меняет inbounds.'
+        read -r -p 'VLESS+TLS, TCP-порт: ' vless_tls_tcp || return 1
+        read -r -p 'VLESS+xHTTP+TLS, порт (например 2053/tcp или 1500/udp для HTTP/3): ' vless_xhttp || return 1
+        read -r -p 'Hy2, UDP-порт: ' hy2_udp || return 1
+        if ! rn_validate_transport_ports "$node_port" "$vless_tls_tcp" "$vless_xhttp" "$hy2_udp"; then
+            rn_log "${ERROR_T} Укажите TCP-порт VLESS TLS, порт xHTTP (/tcp или /udp), UDP-порт Hy2. Конфликты портов одного протокола, порт управления и 61000 не допускаются."
+            return 1
+        fi
+        transport_plan=$(rn_format_transport_plan "$vless_tls_tcp" "$vless_xhttp" "$hy2_udp") || return 1
+    else
+        echo -e "\n${BLUE}⚙️  ВХОДЯЩИЕ ПОРТЫ ДЛЯ КЛИЕНТОВ XRAY${NC}"
+        echo "По умолчанию порты 80 и 443 будут открыты автоматически."
+        read -r -p "Дополнительные порты для Xray в UFW (через пробел) [Нет]: " add_ports_choice || return 1
+        read -ra new_public_ports <<< "${add_ports_choice//,/ }"
+        for entry in "${new_public_ports[@]}"; do
+            if ! rn_public_range_ok "$node_port" "$entry"; then
+                rn_log "${ERROR_T} Некорректный клиентский порт или диапазон: $entry"
+                return 1
             fi
         done
     fi
 
-    echo -e "\nВыберите тип шифрования клиентского трафика:"
-    echo " 1) VLESS Reality (маскировочный сайт / Selfsteal)"
-    echo " 2) VLESS+TLS (классический TLS с вашим доменом ноды)"
-    echo " 3) VLESS+TLS+xHTTP (новый высокопроизводительный транспортный протокол Xray)"
-    read -r -p "Ваш выбор [1]: " proto_choice
-    proto_choice=${proto_choice:-1}
-
-    local protocol="reality"
-    if [ "$proto_choice" -eq 2 ]; then
-        protocol="tls"
-    elif [ "$proto_choice" -eq 3 ]; then
-        protocol="xhttp"
+    local template=status template_rc=0
+    if [[ ! -f "$RN_WWW_DIR/index.html" ]]; then
+        template=$(rn_pick_page_template) || template_rc=$?
+        if (( template_rc == 2 )); then rn_log "${WARNING_T} Установка отменена."; return 1; fi
+        (( template_rc == 0 )) || return 1
     fi
-
-    if [ "$protocol" = "reality" ]; then
-        read -r -p "Домен маскировки (decoy domain) [github.com]: " decoy_domain
-        RN_DECOY_DOMAIN=${decoy_domain:-github.com}
-        rn_generate_masked_template "$RN_DECOY_DOMAIN"
+    if [[ "$protocol" == combined ]]; then
+        rn_configure_combined_firewall "$node_port" "$panel_ip" "$vless_tls_tcp" "$vless_xhttp" "$hy2_udp" || return 1
     else
-        rn_generate_masked_template "$RN_NODE_DOMAIN"
-        rn_issue_ssl_certificates_multi "$RN_NODE_DOMAIN" || { pause_prompt; return 1; }
+        rn_configure_firewall "$node_port" "$panel_ip" "${new_public_ports[@]}" || return 1
     fi
+    if [[ "$protocol" != reality ]]; then
+        rn_issue_ssl_certificates_multi "$RN_NODE_DOMAIN" "$protocol" "$transport_plan" || { pause_prompt; return 1; }
+    fi
+    rn_deploy_compose "$protocol" "$node_port" "$secret_key_value" "$RN_NODE_DOMAIN" "$template" '' "$transport_plan" || { pause_prompt; return 1; }
 
-    rn_deploy_compose "$protocol" "$node_port" "$secret_key_value" || { pause_prompt; return 1; }
-    rn_configure_firewall "$node_port" "$panel_ip"
-
-    echo "$panel_ip" > "$RN_APP_DIR/.panel_ip"
-    echo "$protocol" > "$RN_APP_DIR/.protocol"
-    echo "$RN_NODE_DOMAIN" > "$RN_APP_DIR/.node_domain"
+    printf '%s\n' "$panel_ip" > "$RN_APP_DIR/.panel_ip" || return 1
 
     # Регистрация глобальных команд
-    register_global_commands
+    register_global_commands || return 1
 
     echo -e "\n${GREEN}========================================================${NC}"
     echo -e "🎉   УСТАНОВКА И НАСТРОЙКА НОДЫ УСПЕШНО ЗАВЕРШЕНА!   🎉"
@@ -1444,23 +2009,21 @@ rn_change_domain_and_ssl() {
     fi
 
     read -r -p "Введите новый домен вашей ноды: " new_domain
-    while [ -z "$new_domain" ]; do
-        read -r -p "${RED}Домен не может быть пустым: ${NC}" new_domain
+    while ! rn_valid_domain "$new_domain"; do
+        read -r -p "${RED}Введите корректное DNS-имя: ${NC}" new_domain || return 1
     done
     RN_NODE_DOMAIN="$new_domain"
-    echo "$RN_NODE_DOMAIN" > "$RN_APP_DIR/.node_domain"
+    rn_load_node_state || return 1
 
     local node_port; node_port=$(grep "NODE_PORT" "$RN_APP_DIR/.env" | cut -d'=' -f2 | xargs || echo "2222")
     local secret_key_value; secret_key_value=$(grep "SECRET_KEY" "$RN_APP_DIR/.env" | cut -d'=' -f2- | xargs || echo "")
     local protocol; protocol=$(cat "$RN_APP_DIR/.protocol" 2>/dev/null || echo "tls")
 
-    rn_generate_masked_template "$RN_NODE_DOMAIN"
-
-    if [ "$protocol" = "tls" ] || [ "$protocol" = "xhttp" ]; then
-        rn_issue_ssl_certificates_multi "$RN_NODE_DOMAIN" || { pause_prompt; return 1; }
+    if [[ "$protocol" != reality ]]; then
+        rn_issue_ssl_certificates_multi "$RN_NODE_DOMAIN" "$protocol" || { pause_prompt; return 1; }
     fi
 
-    rn_deploy_compose "$protocol" "$node_port" "$secret_key_value" || { pause_prompt; return 1; }
+    rn_deploy_compose "$protocol" "$node_port" "$secret_key_value" "$RN_NODE_DOMAIN" || { pause_prompt; return 1; }
 
     rn_log "${SUCCESS_T} Домен ноды успешно изменен на $RN_NODE_DOMAIN, конфигурация обновлена!"
     pause_prompt
@@ -1469,7 +2032,7 @@ rn_change_domain_and_ssl() {
 # --- Установка кастомной версии Xray Core ---
 rn_update_xray_core_only() {
     cls
-    echo -e "${BLUE}⚡ УСТАНОВКА/ОБНОВЛЕНИЕ КАСТОМНОЙ ВЕРСИИ XRAY-CORE${NC}"
+    echo -e "${BLUE}⚡ ОБНОВЛЕНИЕ XRAY-CORE С GITHUB${NC}"
     echo -e "${GRAY}--------------------------------------------------${NC}"
 
     if [ ! -f "$RN_APP_DIR/docker-compose.yml" ]; then
@@ -1478,14 +2041,26 @@ rn_update_xray_core_only() {
         return
     fi
 
-    rn_select_xray_version
+    rn_load_node_state || return 1
+    local choice tag
+    printf '%s\n' '1) Последний стабильный релиз' '2) Указать тег вручную' '0) Отмена'
+    read -r -p 'Версия [1]: ' choice || return 1
+    case "${choice:-1}" in
+        1) rn_prepare_latest_xray || return 1 ;;
+        2)
+            read -r -p 'Тег релиза Xray-Core: ' tag || return 1
+            rn_prepare_xray_version "$tag" || return 1
+            ;;
+        0) return 0 ;;
+        *) rn_log "${ERROR_T} Некорректный выбор."; return 1 ;;
+    esac
 
     local node_port; node_port=$(grep "NODE_PORT" "$RN_APP_DIR/.env" | cut -d'=' -f2 | xargs || echo "2222")
     local secret_key_value; secret_key_value=$(grep "SECRET_KEY" "$RN_APP_DIR/.env" | cut -d'=' -f2- | xargs || echo "")
     local protocol; protocol=$(cat "$RN_APP_DIR/.protocol" 2>/dev/null || echo "reality")
-    RN_NODE_DOMAIN=$(cat "$RN_APP_DIR/.node_domain" 2>/dev/null || echo "localhost")
+    RN_NODE_DOMAIN=$(cat "$RN_APP_DIR/.node_domain" 2>/dev/null || true)
 
-    rn_deploy_compose "$protocol" "$node_port" "$secret_key_value" || { pause_prompt; return 1; }
+    rn_deploy_compose "$protocol" "$node_port" "$secret_key_value" "$RN_NODE_DOMAIN" || { pause_prompt; return 1; }
 
     rn_log "${SUCCESS_T} Версия Xray-Core успешно обновлена!"
     pause_prompt
@@ -1507,81 +2082,74 @@ rn_change_panel_ip() {
     rn_log "${INFO_T} Текущий разрешенный IP панели: ${YELLOW}${old_panel_ip:-Не определен}${NC}"
 
     read -r -p "Введите новый IP адрес панели: " new_panel_ip
-    while [[ ! "$new_panel_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; do
-        read -r -p "${RED}Неверный формат IP. Введите корректный IPv4: ${NC}" new_panel_ip
+    while ! rn_valid_ipv4 "$new_panel_ip"; do
+        read -r -p "${RED}Неверный формат IP. Введите корректный IPv4: ${NC}" new_panel_ip || return 1
     done
 
     local node_port; node_port=$(grep "NODE_PORT" "$RN_APP_DIR/.env" | cut -d'=' -f2 | xargs || echo "2222")
 
-    if [ -n "$old_panel_ip" ]; then
-        rn_log "${INFO_T} Удаление старого правила UFW для IP панели: ${YELLOW}$old_panel_ip${NC}"
-        ufw delete allow from "$old_panel_ip" to any port "$node_port" proto tcp >> "$RN_LOG_FILE" 2>&1 || true
+    rn_valid_port "$node_port" || return 1
+    if [[ "$new_panel_ip" == "$old_panel_ip" ]]; then return 0; fi
+    rn_ufw_allow from "$new_panel_ip" to any port "$node_port" proto tcp comment 'Remnanode Control from Panel' || return 1
+    if rn_valid_ipv4 "$old_panel_ip"; then
+        ufw delete allow from "$old_panel_ip" to any port "$node_port" proto tcp >> "$RN_LOG_FILE" 2>&1 || {
+            rn_log "${ERROR_T} Новое правило добавлено, старое не удалено. Проверьте UFW; состояние не изменено."
+            return 1
+        }
     fi
+    printf '%s\n' "$new_panel_ip" > "$RN_APP_DIR/.panel_ip" || return 1
 
-    rn_log "${INFO_T} Добавление правила UFW для нового IP панели: ${GREEN}$new_panel_ip${NC}"
-    ufw allow from "$new_panel_ip" to any port "$node_port" proto tcp comment 'Remnanode Control from Panel' >> "$RN_LOG_FILE" 2>&1 || true
-    ufw reload >> "$RN_LOG_FILE" 2>&1 || true
-
-    echo "$new_panel_ip" > "$RN_APP_DIR/.panel_ip"
-
-    rn_log "${SUCCESS_T} Разрешенный IP панели изменен на $new_panel_ip. Порт $node_port защищен UFW!"
+    rn_log "${SUCCESS_T} Разрешенный IP панели изменен на $new_panel_ip. Проверьте эффективную политику UFW для порта $node_port."
     pause_prompt
 }
 
 # --- Полное удаление ноды с откатом изменений ---
 rn_uninstall_and_rollback() {
     cls
-    echo -e "${RED}⚠️  ВНИМАНИЕ! ПОЛНОЕ УДАЛЕНИЕ НОДЫ И ОТКАТ СИСТЕМЫ${NC}"
-    echo -e "${GRAY}--------------------------------------------------${NC}"
-    echo -e "${RED}Это действие полностью остановит ноду, сотрет все конфигурационные файлы,${NC}"
-    echo -e "${RED}логи, маскировочные сайты, Docker-образы и вернет брандмауэр UFW/оптимизации в исходное состояние.${NC}"
-    echo -e "${GRAY}--------------------------------------------------${NC}"
-    read -r -p "Вы уверены, что хотите продолжить? (y/N): " confirm
-    if [[ ! $confirm =~ ^[Yy]$ ]]; then
-        echo -e "${YELLOW}Удаление отменено.${NC}"
-        sleep 1
-        return
+    echo -e "${RED}Удаление контейнеров и файлов ноды. UFW, sysctl, оригиналы Certbot и общий webroot не меняются.${NC}"
+    local confirm
+    read -r -p "Продолжить? (y/N): " confirm || return 1
+    [[ "$confirm" =~ ^[Yy]$ ]] || return 0
+
+    if [[ ! -f "$RN_APP_DIR/docker-compose.yml" ]]; then
+        rn_log "${WARNING_T} Не найден docker-compose.yml; ничего не удалено."
+        return 1
     fi
-
-    rn_log "${INFO_T} Остановка контейнеров Docker..."
-    if [ -f "$RN_APP_DIR/docker-compose.yml" ]; then
-        cd "$RN_APP_DIR"
-        docker compose down -v >> "$RN_LOG_FILE" 2>&1 || true
-
-        rn_log "${INFO_T} Извлечение и динамическое удаление образов Docker..."
-        local images; images=$(grep -E '^[[:space:]]*image:' "$RN_APP_DIR/docker-compose.yml" | awk '{print $2}' | tr -d '"' | tr -d "'")
-        local img
-        for img in $images; do
-            rn_log "${INFO_T} Удаление образа Docker: ${CYAN}$img${NC}"
-            docker rmi "$img" >> "$RN_LOG_FILE" 2>&1 || true
-        done
+    if ! (cd "$RN_APP_DIR" && docker compose down) >> "$RN_LOG_FILE" 2>&1; then
+        rn_log "${ERROR_T} Docker не остановлен. Файлы ноды оставлены на месте."
+        return 1
     fi
-
-    rn_log "${INFO_T} Удаление системных оптимизаций sysctl и лимитов..."
-    rm -f /etc/sysctl.d/99-remnanode.conf
-    rm -f /etc/sysctl.d/99-remnanode-ipv6.conf
-    rm -f /etc/security/limits.d/99-remnanode.conf
-    sysctl --system >> "$RN_LOG_FILE" 2>&1 || true
-
-    rn_log "${INFO_T} Сброс и деактивация брандмауэра UFW..."
-    if command -v ufw &>/dev/null; then
-        ufw --force reset >> "$RN_LOG_FILE" 2>&1 || true
+    rm -f -- "$RN_LOGROTATE_FILE" || return 1
+    if [[ -f "$RN_RENEW_HOOK" && $(head -n 2 "$RN_RENEW_HOOK" | tail -n 1) == '# safe-remnanode managed certificate hook' ]]; then
+        rm -f -- "$RN_RENEW_HOOK" || return 1
     fi
-
-    rn_log "${INFO_T} Очистка файлов и каталогов..."
-    rm -rf "$RN_APP_DIR"
-    rm -rf "$RN_LOG_DIR"
-    rm -rf "$RN_WWW_DIR"
-    rm -f /etc/logrotate.d/remnanode
-    rm -f /etc/letsencrypt/renewal-hooks/deploy/copy-remnanode-certs.sh
-    rm -f /usr/local/bin/remnanode
-
-    echo -e "\n${GREEN}========================================================${NC}"
-    echo -e "${SUCCESS_T} Нода Remnanode и её Docker-образы успешно удалены!"
-    echo -e "Все сетевые и системные параметры возвращены в исходное состояние."
-    echo -e "${GREEN}========================================================${NC}\n"
-
+    rm -rf -- "$RN_APP_DIR" || return 1
+    echo 'Нода удалена. Логи сохранены. Проверьте UFW, параметры ядра и старый Certbot hook вручную.'
     pause_prompt
+}
+
+rn_apply_node_logging() {
+    local requested_alias="${1:-}"
+    (( $# <= 1 )) || return 1
+    if [[ ! -f "$RN_APP_DIR/docker-compose.yml" || ! -f "$RN_APP_DIR/.protocol" || ! -f "$RN_APP_DIR/.env" ]]; then
+        rn_log "${ERROR_T} Не найден деплой, созданный установщиком."
+        return 1
+    fi
+    rn_load_node_state || return 1
+    local node_port secret protocol domain
+    node_port=$(sed -n 's/^NODE_PORT=//p' "$RN_APP_DIR/.env") || return 1
+    secret=$(sed -n 's/^SECRET_KEY=//p' "$RN_APP_DIR/.env") || return 1
+    IFS= read -r protocol < "$RN_APP_DIR/.protocol" || return 1
+    domain=$(cat "$RN_APP_DIR/.node_domain" 2>/dev/null || true)
+    local backup f
+    install -d -m 0700 "$BACKUP_DIR" || return 1
+    backup=$(mktemp -d "$BACKUP_DIR/node-logs.XXXXXXXX") || return 1
+    for f in .env docker-compose.yml nginx.conf .cert_path_domain; do
+        if [[ -f "$RN_APP_DIR/$f" ]]; then cp -p -- "$RN_APP_DIR/$f" "$backup/$f" || return 1; fi
+    done
+    rn_log "${INFO_T} Предыдущие конфигурации сохранены в $backup."
+    rn_log "${INFO_T} Подключение журналов к текущей ноде. Конфигурации Compose и nginx будут пересозданы из настроек установщика."
+    rn_deploy_compose "$protocol" "$node_port" "$secret" "$domain" status "$requested_alias"
 }
 
 # --- Диагностика и просмотр логов ноды ---
@@ -1640,10 +2208,11 @@ rn_diagnose_and_logs() {
             echo -e "   - remnawave-nginx:  $nginx_status"
 
             echo -e "\n📌 ${WHITE}Размер лог-файлов на хосте:${NC}"
-            local node_acc_size; node_acc_size=$(du -sh "$RN_LOG_DIR/node/xray.out.log" 2>/dev/null | awk '{print $1}' || echo "0B")
-            local node_err_size; node_err_size=$(du -sh "$RN_LOG_DIR/node/xray.err.log" 2>/dev/null | awk '{print $1}' || echo "0B")
-            local nginx_acc_size; nginx_acc_size=$(du -sh "$RN_LOG_DIR/nginx/access.log" 2>/dev/null | awk '{print $1}' || echo "0B")
-            local nginx_err_size; nginx_err_size=$(du -sh "$RN_LOG_DIR/nginx/error.log" 2>/dev/null | awk '{print $1}' || echo "0B")
+            local node_acc_size; node_acc_size=$(du -sh "$RN_LOG_DIR/access.log" 2>/dev/null | awk '{print $1}' || echo "0B")
+            local node_err_size; node_err_size=$(du -sh "$RN_LOG_DIR/error.log" 2>/dev/null | awk '{print $1}' || echo "0B")
+            local nginx_log_dir; nginx_log_dir=$(rn_nginx_log_dir)
+            local nginx_acc_size; nginx_acc_size=$(du -sh "$nginx_log_dir/access.log" 2>/dev/null | awk '{print $1}' || echo "0B")
+            local nginx_err_size; nginx_err_size=$(du -sh "$nginx_log_dir/error.log" 2>/dev/null | awk '{print $1}' || echo "0B")
 
             echo -e "   - Xray access.log:  ${CYAN}$node_acc_size${NC}"
             echo -e "   - Xray error.log:   ${CYAN}$node_err_size${NC}"
@@ -1665,26 +2234,26 @@ rn_diagnose_and_logs() {
                 1)
                     cls
                     echo -e "${BLUE}Показ лога access.log (Выход: Ctrl+C)...${NC}\n"
-                    tail -n 100 -f "$RN_LOG_DIR/node/xray.out.log" || true
+                    tail -n 100 -f "$RN_LOG_DIR/access.log" || true
                     ;;
                 2)
                     cls
                     echo -e "${BLUE}Показ лога error.log (Выход: Ctrl+C)...${NC}\n"
-                    tail -n 100 -f "$RN_LOG_DIR/node/xray.err.log" || true
+                    tail -n 100 -f "$RN_LOG_DIR/error.log" || true
                     ;;
                 3)
                     cls
                     echo -e "${BLUE}Показ лога Nginx (Выход: Ctrl+C)...${NC}\n"
-                    tail -n 100 -f "$RN_LOG_DIR/nginx/access.log" || true
+                    tail -n 100 -F "$nginx_log_dir/access.log" || true
                     ;;
                 4)
                     cls
                     echo -e "${BLUE}Показ Docker-логов remnanode (Выход: Ctrl+C)...${NC}\n"
-                    docker compose -f "$RN_APP_DIR/docker-compose.yml" logs -f --tail=100 || true
+                    docker compose -f "$RN_APP_DIR/docker-compose.yml" logs -f --tail=100 remnanode || true
                     ;;
                 5)
                     echo -e "${INFO_T} Запуск принудительной ротации логов..."
-                    if logrotate -f /etc/logrotate.d/remnanode; then
+                    if logrotate -f "$RN_LOGROTATE_FILE"; then
                         echo -e "${SUCCESS_T} Ротация логов успешно выполнена!"
                     else
                         echo -e "${ERROR_T} Ошибка выполнения ротации!"
@@ -1701,6 +2270,12 @@ rn_diagnose_and_logs() {
 
 # --- Управление кастомными портами Xray и UFW ---
 rn_manage_xray_ports() {
+    if [[ -f "$RN_APP_DIR/.transport_ports" ]]; then
+        rn_check_transport_ports || true
+        rn_log "${INFO_T} Для изменения портов с учётом TCP/UDP используйте node-transports <TLS TCP> <xHTTP port[/tcp|/udp]> <Hy2 UDP>."
+        pause_prompt
+        return 0
+    fi
     while true; do
         cls
         echo -e "${GREEN}"
@@ -1719,7 +2294,7 @@ rn_manage_xray_ports() {
         local node_port; node_port=$(grep "NODE_PORT" "$RN_APP_DIR/.env" | cut -d'=' -f2 | xargs || echo "2222")
 
         echo -e "📌 ${WHITE}Базовые порты ноды:${NC}"
-        echo -e "   - Port управления нодой:  ${CYAN}$node_port${NC} (Открыт в UFW только для IP панели: ${GREEN}$panel_ip${NC})"
+        echo -e "   - Порт управления: ${CYAN}$node_port${NC} (настроенный IP панели: ${GREEN}$panel_ip${NC})"
         echo -e "   - Стандартные веб-порты:   ${CYAN}80, 443${NC} (Всегда открыты глобально для входящего трафика)"
 
         echo -e "\n📌 ${WHITE}Список кастомных входящих портов Xray в UFW:${NC}"
@@ -1747,44 +2322,25 @@ rn_manage_xray_ports() {
                 echo -e "\n${BLUE}Добавление нового клиентского порта:${NC}"
                 read -r -p "Введите номер порта или диапазон (например, 8443 или 2000:2010): " input_port
 
-                local is_range="no"
-                if [[ "$input_port" =~ ^([0-9]+):([0-9]+)$ ]]; then
-                    is_range="yes"
-                    local start_port="${BASH_REMATCH[1]}"
-                    local end_port="${BASH_REMATCH[2]}"
-                    if [ "$start_port" -lt 1 ] || [ "$end_port" -gt 65535 ] || [ "$start_port" -gt "$end_port" ]; then
-                        rn_log "${ERROR_T} Некорректный диапазон портов."
-                        pause_prompt
-                        continue
-                    fi
-                elif [[ "$input_port" =~ ^[0-9]+$ ]]; then
-                    if [ "$input_port" -lt 1 ] || [ "$input_port" -gt 65535 ]; then
-                        rn_log "${ERROR_T} Некорректный номер порта."
-                        pause_prompt
-                        continue
-                    fi
+                if ! rn_public_range_ok "$node_port" "$input_port"; then
+                    rn_log "${ERROR_T} Некорректный диапазон или пересечение с портом управления."
                 else
-                    rn_log "${ERROR_T} Некорректный ввод порта."
-                    pause_prompt
-                    continue
+                    local canonical
+                    canonical=$(rn_normalize_port_range "$input_port") || return 1
+                    local -a saved_ports=()
+                    rn_collect_custom_ports "$node_port" saved_ports || return 1
+                    if [[ "$canonical" == 443 ]]; then
+                        rn_log "${INFO_T} TCP и UDP 443 — базовые правила ноды, отдельная запись не нужна."
+                    elif rn_allow_custom_port "$canonical"; then
+                        if ! printf '%s\n' "${saved_ports[@]}" | grep -Fx -- "$canonical" >/dev/null; then
+                            saved_ports+=("$canonical")
+                        fi
+                        rn_store_custom_ports "${saved_ports[@]}" || return 1
+                        rn_log "${SUCCESS_T} Правила UFW для $canonical проверены."
+                    else
+                        rn_log "${ERROR_T} Не все правила UFW применены; проверьте текущие правила."
+                    fi
                 fi
-
-                if [ "$is_range" = "yes" ]; then
-                    echo "$start_port:$end_port" >> "$RN_APP_DIR/.xray_ports"
-                    {
-                        ufw allow "$start_port:$end_port"/tcp comment 'Xray Custom Port Range TCP'
-                        ufw allow "$start_port:$end_port"/udp comment 'Xray Custom Port Range UDP'
-                    } >> "$RN_LOG_FILE" 2>&1 || true
-                    rn_log "${SUCCESS_T} Диапазон портов $start_port:$end_port добавлен в UFW!"
-                else
-                    echo "$input_port" >> "$RN_APP_DIR/.xray_ports"
-                    {
-                        ufw allow "$input_port"/tcp comment 'Xray Custom Port TCP'
-                        ufw allow "$input_port"/udp comment 'Xray Custom Port UDP'
-                    } >> "$RN_LOG_FILE" 2>&1 || true
-                    rn_log "${SUCCESS_T} Порт $input_port добавлен в UFW!"
-                fi
-                ufw reload >> "$RN_LOG_FILE" 2>&1 || true
                 pause_prompt
                 ;;
             2)
@@ -1805,26 +2361,26 @@ rn_manage_xray_ports() {
                 echo -e "${GRAY}--------------------------------------------------${NC}"
                 read -r -p "Введите номер порта для удаления: " del_num
                 del_num=${del_num:-0}
-                if [ "$del_num" -ge 1 ] && [ "$del_num" -le "${#port_list[@]}" ]; then
+                if [[ "$del_num" =~ ^[1-9][0-9]{0,5}$ ]] && [ "$del_num" -ge 1 ] && [ "$del_num" -le "${#port_list[@]}" ]; then
                     local target="${port_list[$((del_num-1))]}"
-                    sed -i "/^${target}$/d" "$RN_APP_DIR/.xray_ports"
-                    if [[ "$target" =~ ^([0-9]+):([0-9]+)$ ]]; then
-                        ufw delete allow "$target"/tcp >> "$RN_LOG_FILE" 2>&1 || true
-                        ufw delete allow "$target"/udp >> "$RN_LOG_FILE" 2>&1 || true
+                    if rn_public_range_ok "$node_port" "$target" &&
+                       rn_delete_custom_port "$target"; then
+                        sed -i "/^${target}$/d" "$RN_APP_DIR/.xray_ports" || return 1
+                        rn_log "${SUCCESS_T} Правила UFW для $target удалены."
                     else
-                        ufw delete allow "$target"/tcp >> "$RN_LOG_FILE" 2>&1 || true
-                        ufw delete allow "$target"/udp >> "$RN_LOG_FILE" 2>&1 || true
+                        rn_log "${ERROR_T} Не все правила UFW удалены; проверьте текущие правила."
                     fi
-                    ufw reload >> "$RN_LOG_FILE" 2>&1 || true
-                    rn_log "${SUCCESS_T} Порт $target удален из UFW."
                 else
                     rn_log "${ERROR_T} Неверный номер."
                 fi
                 pause_prompt
                 ;;
             3)
-                ufw reload >> "$RN_LOG_FILE" 2>&1 || true
-                rn_log "${SUCCESS_T} Правила UFW перезагружены."
+                if ufw reload >> "$RN_LOG_FILE" 2>&1; then
+                    rn_log "${SUCCESS_T} Правила UFW перезагружены."
+                else
+                    rn_log "${ERROR_T} Не удалось перезагрузить UFW."
+                fi
                 pause_prompt
                 ;;
             0)
@@ -1834,69 +2390,24 @@ rn_manage_xray_ports() {
     done
 }
 
-# --- Смена маскировочного шаблона (Selfsteal) ---
+# --- Управление локальным HTML-шаблоном ---
 rn_change_decoy_template_menu() {
-    while true; do
-        cls
-        echo -e "${GREEN}"
-        echo "  ========================================================"
-        echo "  🎭 СМЕНА МАСКИРОВОЧНОГО ШАБЛОНА САЙТА (SELFSTEAL)"
-        echo "  ========================================================"
-        echo -e "${NC}"
-
-        if [ ! -f "$RN_APP_DIR/docker-compose.yml" ]; then
-            rn_log "${ERROR_T} Нода еще не установлена! Маскировка недоступна."
-            pause_prompt
-            return
-        fi
-
-        local node_domain; node_domain=$(cat "$RN_APP_DIR/.node_domain" 2>/dev/null || echo "localhost")
-
-        echo -e "📌 Домен вашей ноды: ${CYAN}$node_domain${NC}"
-        echo -e "--------------------------------------------------------"
-        echo " 1) 🔄 Сменить шаблон на СЛУЧАЙНЫЙ (Рандомно)"
-        echo " 2) 🎨 Выбрать КОНКРЕТНЫЙ шаблон из списка"
-        echo " 0) Назад"
-        echo -e "${GRAY}--------------------------------------------------${NC}"
-        read -r -p "Выберите действие [0-2]: " temp_choice
-        temp_choice=${temp_choice:-0}
-
-        local templates=("endless-verify" "esports-stream-template" "levelup-hub" "playza-game-catalog" "rybaliti-2.0" "screenwire-digest" "vibrai-photo-editor" "worldzoo-stream-template")
-        local templates_ru=("Страница верификации (endless-verify)" "Киберспортивный портал (esports-stream-template)" "Игровой хаб для геймеров (levelup-hub)" "Каталог онлайн-игр (playza-game-catalog)" "Блог/Форум о рыбалке (rybaliti-2.0)" "Новостной IT-дайджест (screenwire-digest)" "Онлайн-фоторедактор (vibrai-photo-editor)" "Стримы из зоопарков (worldzoo-stream-template)")
-
-        case $temp_choice in
-            1)
-                rn_generate_masked_template "$node_domain"
-                docker restart remnawave-nginx >> "$RN_LOG_FILE" 2>&1 || true
-                rn_log "${SUCCESS_T} Маскировочный шаблон успешно изменен на случайный и перезапущен!"
-                pause_prompt
-                ;;
-            2)
-                echo -e "\n${BLUE}Доступные профессиональные шаблоны:${NC}"
-                local i
-                for i in "${!templates[@]}"; do
-                    echo -e " $((i+1))) ${templates_ru[$i]}"
-                done
-                echo -e "${GRAY}--------------------------------------------------${NC}"
-                read -r -p "Выберите номер шаблона [1]: " template_num
-                template_num=${template_num:-1}
-                local index=$((template_num - 1))
-
-                if [ $index -ge 0 ] && [ $index -lt ${#templates[@]} ]; then
-                    local chosen="${templates[$index]}"
-                    rn_generate_masked_template "$node_domain" "$chosen"
-                    docker restart remnawave-nginx >> "$RN_LOG_FILE" 2>&1 || true
-                    rn_log "${SUCCESS_T} Маскировочный сайт успешно изменен на '${chosen}' и перезапущен!"
-                else
-                    rn_log "${ERROR_T} Неверный номер шаблона."
-                fi
-                pause_prompt
-                ;;
-            0)
-                return
-                ;;
-        esac
-    done
+    local template rc=0
+    if [[ ! -f "$RN_APP_DIR/docker-compose.yml" ]]; then
+        rn_log "${ERROR_T} Нода ещё не установлена."
+        pause_prompt
+        return 0
+    fi
+    template=$(rn_pick_page_template) || rc=$?
+    if (( rc == 2 )); then return 0; fi
+    if (( rc != 0 )) || ! rn_render_page_template "$template"; then
+        rn_log "${ERROR_T} Не удалось обновить HTML-шаблон."
+    elif grep -Fq -- "$RN_WWW_DIR:/var/www/html:ro" "$RN_APP_DIR/docker-compose.yml"; then
+        rn_log "${SUCCESS_T} Тема $template применена без перезапуска контейнера."
+    else
+        rn_log "${SUCCESS_T} Тема $template сохранена; старый деплой подключит новый webroot при обновлении Compose."
+    fi
+    pause_prompt
 }
 
 # --- Меню управления нодой ---
@@ -1928,19 +2439,19 @@ rn_node_menu() {
         echo " 3) ⚡ Установка/Обновление кастомной версии Xray-Core"
         echo " 4) 🔌 Смена IP адреса панели (Обновление правил UFW)"
         echo " 5) 🔌 Управление клиентскими портами Xray и UFW"
-        echo " 6) 🎭 Смена маскировочного шаблона сайта (Selfsteal)"
+        echo " 6) 🎭 Настроить HTML-шаблон"
         echo " 7) 📊 Диагностика и просмотр логов ноды"
-        echo " 8) 🗑️  Полное удаление ноды с откатом всех изменений"
+        echo " 8) 🗑️  Удаление ноды без сброса UFW"
         echo " 0) Назад"
         echo -e "${GRAY}--------------------------------------------------${NC}"
         read -r -p "Выберите действие [0-8]: " menu_choice
         menu_choice=${menu_choice:-0}
 
         case $menu_choice in
-            1) rn_initial_setup ;;
-            2) rn_change_domain_and_ssl ;;
-            3) rn_update_xray_core_only ;;
-            4) rn_change_panel_ip ;;
+            1) rn_initial_setup || { rn_log "${ERROR_T} Установка не завершена."; pause_prompt; } ;;
+            2) rn_change_domain_and_ssl || { rn_log "${ERROR_T} Смена домена не завершена."; pause_prompt; } ;;
+            3) rn_update_xray_core_only || { rn_log "${ERROR_T} Обновление Xray не завершено."; pause_prompt; } ;;
+            4) rn_change_panel_ip || { rn_log "${ERROR_T} Смена IP не завершена."; pause_prompt; } ;;
             5) rn_manage_xray_ports ;;
             6) rn_change_decoy_template_menu ;;
             7) rn_diagnose_and_logs ;;
@@ -3023,6 +3534,7 @@ Description=RKN Watcher daily update timer
 [Timer]
 OnCalendar=*-*-* 03:00:00
 Persistent=true
+RandomizedDelaySec=20m
 Unit=rkn-watcher-update.service
 
 [Install]
@@ -3643,19 +4155,10 @@ run_multitest() {
         need_cmd traceroute traceroute || true
         need_cmd jq jq || true
 
-        # Верификация SHA256 внешних скриптов отключена по требованию:
-        # тесты запускаются сразу, только по HTTPS (см. secure_download).
         while true; do
             show_header
             echo -e "${CYAN}── ДОСТУПНЫЕ ТЕСТЫ ──${NC}\n"
             echo " 1) IP Region / Геолокация"
-            echo " 2) Censorcheck — геоблок"
-            echo " 3) Censorcheck — DPI"
-            echo " 4) iPerf3 — RU сервера"
-            echo " 5) iPerf3 — bench.tlab.pw (РФ)"
-            echo " 6) YABS"
-            echo " 7) IP Check Place"
-            echo " 8) IPQuality"
             echo " 9) sysbench CPU"
             echo "10) sysbench Memory"
             echo "11) Network Bench (100MB)"
@@ -3668,13 +4171,6 @@ run_multitest() {
             echo ""
             case $choice in
               1) mt_run_one 1; pause_prompt ;;
-              2) mt_run_one 2; pause_prompt ;;
-              3) mt_run_one 3; pause_prompt ;;
-              4) mt_run_one 4; pause_prompt ;;
-              5) mt_run_one 5; pause_prompt ;;
-              6) mt_run_one 6; pause_prompt ;;
-              7) mt_run_one 7; pause_prompt ;;
-              8) mt_run_one 8; pause_prompt ;;
               9) mt_run_one 9; pause_prompt ;;
               10) mt_run_one 10; pause_prompt ;;
               11) mt_run_one 11; pause_prompt ;;
@@ -3693,13 +4189,6 @@ run_multitest() {
 mt_run_one() {
     case "$1" in
         1) curl -fsSL --proto '=https' --tlsv1.2 https://ipapi.co/json 2>/dev/null | jq '.' 2>/dev/null || curl -fsSL --proto '=https' --tlsv1.2 https://ipinfo.io 2>/dev/null || echo "Ошибка получения данных." ;;
-        2) run_verified_script "Censorcheck" "https://github.com/vernette/censorcheck/raw/master/censorcheck.sh" "" -- --mode geoblock || true ;;
-        3) run_verified_script "Censorcheck DPI" "https://github.com/vernette/censorcheck/raw/master/censorcheck.sh" "" -- --mode dpi || true ;;
-        4) need_cmd iperf3 iperf3 || true; run_verified_script "iPerf3 RU" "https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh" "" || true ;;
-        5) need_cmd iperf3 iperf3 || true; run_verified_script "iPerf3 tlab (РФ)" "https://bench.tlab.pw" "" || true ;;
-        6) run_verified_script "YABS" "https://yabs.sh" "" -- -4 || true ;;
-        7) run_verified_script "IP Check Place" "https://ip.check.place/script/check.sh" "" -- -l ru || true ;;
-        8) run_verified_script "IPQuality" "https://check.place/script/check.sh" "" -- -l ru -I || true ;;
         9) need_cmd sysbench sysbench || true; sysbench cpu --cpu-max-prime=20000 run || true ;;
         10) need_cmd sysbench sysbench || true; sysbench memory run || true ;;
         11) echo "Тест скорости: файлы 100MB"; wget -qO /dev/null http://speedtest.tele2.net/100MB.zip || wget -qO /dev/null http://ipv4.download.thinkbroadband.com/100MB.zip || true ;;
@@ -3713,13 +4202,6 @@ mt_run_one() {
 mt_run_all() {
     local names=(
         "IP Region"
-        "Censorcheck — проверка геоблока"
-        "Censorcheck — DPI (серверы РФ)"
-        "iPerf3 — тест до российских серверов"
-        "iPerf3 — bench.tlab.pw (РФ)"
-        "YABS — бенчмарк сервера"
-        "IP Check Place — блокировки зарубежными сервисами"
-        "IPQuality"
         "sysbench CPU — тест процессора"
         "sysbench Memory — тест оперативной памяти"
         "Network Bench — скорость (100MB)"
@@ -3727,6 +4209,7 @@ mt_run_all() {
         "Traceroute yandex.ru"
         "Ping yandex.ru"
     )
+    local ids=(1 9 10 11 12 13 14)
     local total=${#names[@]}
     echo -e "  ${YELLOW}Enter${NC} — запустить | ${YELLOW}s${NC} — пропустить | ${YELLOW}q${NC} — выход"
     echo -e "  ${GRAY}Ctrl+C во время теста — пропустить текущий и продолжить${NC}"
@@ -3743,7 +4226,7 @@ mt_run_all() {
         esac
         sleep 1
         # В подоболочке: Ctrl+C убивает только текущий тест
-        ( trap - INT; mt_run_one "$num" )
+        ( trap - INT; mt_run_one "${ids[$i]}" )
         echo ""
     done
     echo -e "${GREEN}Все тесты завершены! (${total}/${total})${NC}"
@@ -3754,31 +4237,25 @@ mt_run_all() {
 register_global_commands() {
     local script_path="${SCRIPT_PATH:-$(readlink -f "$0" 2>/dev/null || echo "$0")}"
 
-    # Удалённый запуск (curl | bash): сохраняем физический файл в /usr/local/bin
-    if [[ "$script_path" =~ /dev/fd/ || "$script_path" == "bash" || "$script_path" == "stdin" || ! -f "$script_path" ]]; then
-        echo -e "${INFO_T} Обнаружен удалённый запуск. Сохраняю скрипт в систему..."
-        mkdir -p /usr/local/bin
-        if wget -q -O "/usr/local/bin/safe-remnanode-setup" "$UNIVERSAL_SCRIPT_URL"; then
-            chmod +x /usr/local/bin/safe-remnanode-setup
-            SCRIPT_PATH="/usr/local/bin/safe-remnanode-setup"
+    local dest=/usr/local/bin/safe-remnanode-setup tmp
+    [[ -f "$script_path" && "$script_path" != /dev/* ]] || { echo 'Запустите установщик из локального файла.' >&2; return 1; }
+    if [[ "$script_path" != "$dest" && "$script_path" != "$RKN_MAIN_SCRIPT" ]]; then
+        tmp=$(mktemp /usr/local/bin/.safe-remnanode.XXXXXXXX) || return 1
+        if ! install -m 0755 "$script_path" "$tmp" || ! mv -fT "$tmp" "$dest"; then
+            rm -f -- "$tmp"
+            return 1
         fi
     fi
-
-    if [[ -f "$script_path" && "$script_path" != "/usr/local/bin/safe-remnanode-setup" ]]; then
-        # Если запущена УСТАНОВЛЕННАЯ копия из /opt/rkn-watcher (systemd-юниты защиты),
-        # не перезаписываем ею более свежую копию пользователя в /usr/local/bin.
-        if [[ "$script_path" == "$RKN_MAIN_SCRIPT" && -f "/usr/local/bin/safe-remnanode-setup" ]]; then
-            :
+    [[ -x "$dest" ]] || return 1
+    local alias path
+    for alias in remnanode rkn-watcher; do
+        path="/usr/local/bin/$alias"
+        if [[ -e "$path" || -L "$path" ]]; then
+            [[ "$(readlink "$path" 2>/dev/null)" == "$dest" ]] || { echo "Существующая команда $path оставлена без изменений." >&2; continue; }
         else
-            cp "$script_path" /usr/local/bin/safe-remnanode-setup 2>/dev/null || true
+            ln -s "$dest" "$path" || return 1
         fi
-    fi
-    chmod +x /usr/local/bin/safe-remnanode-setup 2>/dev/null || true
-
-    # Совместимые команды: remnanode → меню ноды, rkn-watcher → меню защиты
-    ln -sf /usr/local/bin/safe-remnanode-setup /usr/local/bin/remnanode 2>/dev/null || true
-    ln -sf /usr/local/bin/safe-remnanode-setup /usr/local/bin/rkn-watcher 2>/dev/null || true
-    echo -e "${SUCCESS_T} Команды зарегистрированы: ${CYAN}safe-remnanode-setup${NC}, ${CYAN}remnanode${NC}, ${CYAN}rkn-watcher${NC}"
+    done
 }
 
 # ==============================================================================
@@ -3801,27 +4278,10 @@ express_install() {
 
     # --- ШАГ 1: Сервер ---
     echo -e "\n${CYAN}════════════ ШАГ 1/3: НАСТРОЙКА СЕРВЕРА ════════════${NC}"
-    echo -e "${INFO_T} Выполняется: обновление системы, базовый софт, Docker, BBR, авто-hardening..."
-    apt_update || true
-    apt_upgrade_full || true
-    apt_autoclean
-    apt_install mc net-tools ncdu iftop curl wget git ca-certificates gnupg lsb-release || true
-    if ! command -v docker &>/dev/null; then
-        install_docker_apt || echo -e "${WARNING_T} Docker не установился — проверьте лог"
-    fi
-    enable_bbr_cake
-    apply_sysctl_auto
-    apt_install irqbalance || true
-    systemctl enable --now irqbalance >>"$(log_file)" 2>&1 || true
+    echo -e "${INFO_T} Проверка Docker. Обновление ОС и sysctl доступны отдельно в меню сервера."
+    if ! command -v docker >/dev/null; then install_docker_apt || return 1; fi
+    docker compose version >> "$(log_file)" 2>&1 || return 1
     echo -e "${SUCCESS_T} Шаг 1 завершён."
-    if [[ -f /var/run/reboot-required ]]; then
-        echo -e "${WARNING_T} Система требует перезагрузки (рекомендуется перед установкой ноды)."
-        read -r -p "Перезагрузить сейчас? (y/N): " rr
-        if [[ "${rr:-n}" =~ ^[Yy]$ ]]; then
-            echo "Перезагрузка... После перезагрузки запустите: sudo safe-remnanode-setup express"
-            reboot
-        fi
-    fi
 
     # --- ШАГ 2: Нода ---
     echo -e "\n${CYAN}════════════ ШАГ 2/3: УСТАНОВКА НОДЫ ════════════${NC}"
@@ -3830,6 +4290,7 @@ express_install() {
     if [[ $go_node =~ ^[Yy] ]]; then
         if ! rn_initial_setup; then
             echo -e "${WARNING_T} Установка ноды не завершилась (см. лог). Можно повторить позже из главного меню."
+            return 1
         fi
     else
         echo -e "${YELLOW}Шаг 2 пропущен.${NC}"
@@ -3837,17 +4298,18 @@ express_install() {
 
     # --- ШАГ 3: Защита ---
     echo -e "\n${CYAN}════════════ ШАГ 3/3: УСТАНОВКА ЗАЩИТЫ ════════════${NC}"
-    read -r -p "Перейти к установке защиты RKN-Watcher? [Y/n]: " go_rkn
-    go_rkn=${go_rkn:-Y}
+    read -r -p "Перейти к установке защиты RKN-Watcher? [y/N]: " go_rkn
+    go_rkn=${go_rkn:-N}
     if [[ $go_rkn =~ ^[Yy] ]]; then
         if ! rkn_install_or_upgrade; then
             echo -e "${WARNING_T} Установка защиты не завершилась (см. лог). Можно повторить позже из главного меню."
+            return 1
         fi
     else
         echo -e "${YELLOW}Шаг 3 пропущен.${NC}"
     fi
 
-    register_global_commands
+    register_global_commands || return 1
 
     echo -e "\n${GREEN}========================================================${NC}"
     echo -e "🎉   ЭКСПРЕСС-УСТАНОВКА ЗАВЕРШЕНА!   🎉"
@@ -3874,7 +4336,7 @@ main_menu() {
         echo ""
         echo " 7. 🧪 Диагностика и мульти-тесты сервера"
         echo " 8. 🌐 Управление IPv6 (вкл/выкл + откат)"
-        echo " 9. 🔥 UFW-менеджер (Balbuto/ufw-manager)"
+        echo " 9. 🔥 Статус UFW"
         echo ""
         echo " 0. Выйти"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${NC}"
@@ -3914,11 +4376,15 @@ print_usage() {
 Использование: $0 [команда]
 
 Команды:
+  install-cli       установить локальную копию и команды-синонимы
   menu              интерактивное главное меню (по умолчанию)
   express           полная установка: сервер + нода + защита
   server            настройка сервера (база, Docker, BBR, sysctl)
   node              установка ноды Remnawave
   node-menu         меню управления нодой
+  node-logs [зона]  настроить логи и (опционально) путь TLS-сертификата в контейнере
+  node-transports <tls> <xhttp[/tcp|/udp]> <hy2>  применить порты без пересоздания контейнеров
+  node-check-ports  проверить локальные слушатели Xray для трёх транспортов
   protect           установка/обновление защиты RKN-Watcher
   protect-menu      меню управления защитой
   protect-update    обновить блок-листы TSPUBLOCK/GOVIPS
@@ -3935,25 +4401,23 @@ EOF
 }
 
 main() {
+    local cmd=${1:-menu} basename_cmd=${0##*/}
+    case "$cmd" in -h|--help|help) print_usage; return 0 ;; esac
+    check_root >&2 || return 1
+    case "$cmd:$basename_cmd" in
+        protect-status:*|status:rkn-watcher*) rkn_show_status noninteractive; return $? ;;
+        node-check-ports:*) rn_check_transport_ports; return $? ;;
+    esac
     SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
     init_logging
-    setup_general_logrotate || true
-    mkdir -p "$BACKUP_DIR" 2>/dev/null || true
     check_os
     detect_arch
     trap 'echo -e "\n${YELLOW}Прервано${NC}"; exit 130' INT
 
-    local cmd=${1:-menu}
-    local basename_cmd
-    basename_cmd=$(basename "$0")
-
-    # Регистрация глобальных команд при каждом запуске (как в оригинальном setup_node.sh)
-    register_global_commands
-
     # Совместимость с оригинальными командами по имени файла
     if [[ "$basename_cmd" == "remnanode"* ]]; then
         case "$cmd" in
-            install|setup) rn_initial_setup; return 0 ;;
+            install|setup) rn_initial_setup; return $? ;;
             menu|"") rn_node_menu; return 0 ;;
         esac
     fi
@@ -3969,11 +4433,14 @@ main() {
     fi
 
     case "$cmd" in
+        install-cli) register_global_commands && setup_general_logrotate ;;
         menu|"") main_menu ;;
         express) express_install ;;
         server) check_root && base_setup ;;
         node) rn_initial_setup ;;
         node-menu) rn_node_menu ;;
+        node-logs) rn_apply_node_logging "${@:2}" ;;
+        node-transports) rn_set_existing_transport_ports "${@:2}" ;;
         protect) rkn_install_or_upgrade ;;
         protect-menu) rkn_protect_menu ;;
         protect-update) rkn_update_all ;;
@@ -3991,4 +4458,4 @@ main() {
     esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
