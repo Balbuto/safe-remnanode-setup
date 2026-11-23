@@ -1,7 +1,7 @@
 <img width="1536" height="1024" alt="ChatGPT Image 10 авг  2026 г , 03_05_17" src="https://github.com/user-attachments/assets/faf25857-ea5b-44ac-b984-ed780ee3c632" />
 
 
-# 🛡️ Safe RemnaNode Setup v1.1.0+hardening.13
+# 🛡️ Safe RemnaNode Setup v1.1.0+hardening.15
 
 **Универсальный интерактивный установщик ноды Remnawave** — один скрипт, основанный на трёх проектах:
 
@@ -11,7 +11,9 @@
 | [Balbuto/setup-remna-node](https://github.com/Balbuto/setup-remna-node) | Установка и управление нодой Remnawave: Xray-Core (VLESS Reality / TLS / xHTTP), SSL (Cloudflare / Gcore / Standalone), маскировка Selfsteal, UFW, логи |
 | [Balbuto/RKN-Watcher](https://github.com/Balbuto/RKN-Watcher) | Защита от сканеров РКН: блок-листы TSPUBLOCK/GOVIPS (iptables+ipset), GeoIP-фильтрация по странам, allow/deny IP и порты, systemd timer |
 
-**Один скрипт — три модуля + экспресс-режим полной установки.**
+**Один установщик — три функциональных модуля + экспресс-режим полной установки.**
+
+Исходники теперь разложены по `lib/` и `vendor/`, но для VPS релиз по-прежнему поставляется одним самодостаточным `safe-remnanode-setup.sh`. Не скачивайте отдельно модульный загрузчик: он предназначен для разработки из полного дерева исходников.
 
 ---
 
@@ -25,29 +27,34 @@
 
 ### Быстрый старт
 
-**Скачать и запустить исходную версию с GitHub.** Ветка `main` — версия оригинального репозитория; локальная ревизия `hardening.13` по этой ссылке не опубликована. Скачивайте в отдельный каталог, проверяйте файл перед запуском от root и не используйте `curl | bash`.
+**Установка на VPS — однофайловым релизом.** После публикации этой ревизии в `main` ссылка ниже будет отдавать сгенерированный `safe-remnanode-setup.sh`, уже содержащий модули установщика и закреплённый RKN Watcher. Для обычной установки не нужны `lib/`, `vendor/`, Python или сборщик.
 
 ```bash
 wget -O safe-remnanode-setup.sh https://raw.githubusercontent.com/Balbuto/safe-remnanode-setup/main/safe-remnanode-setup.sh
 ```
 
-После проверки скачанного файла:
+Проверьте скачанный файл, затем запустите меню:
 
 ```bash
 chmod +x safe-remnanode-setup.sh
 sudo ./safe-remnanode-setup.sh
 ```
 
-**Запустить `hardening.13` из ZIP.** Скопируйте `safe-remnanode-hardening.zip` на сервер и выполните:
+Чтобы сразу перейти к установке ноды, укажите `node`:
 
 ```bash
-unzip safe-remnanode-hardening.zip
-cd safe-remnanode-setup
-bash ./safe-remnanode-setup.sh --help
-sudo bash ./safe-remnanode-setup.sh node  # сразу запустить установку ноды
+sudo ./safe-remnanode-setup.sh node
 ```
 
-Для открытия главного меню уберите `node`. Для обновления только команд на действующем сервере используйте `sudo bash ./safe-remnanode-setup.sh install-cli` вместо `node`.
+Если вы скачали **полный ZIP исходников репозитория**, запустите тот же однофайловый установщик из корня распакованного проекта:
+
+```bash
+sudo bash ./safe-remnanode-setup.sh
+```
+
+`safe-remnanode-setup-modular.sh` — загрузчик исходников для разработки и тестирования, не замена релизному файлу. Для изменений редактируйте `lib/`, затем собирайте `safe-remnanode-setup.sh` через `python3 tools/build_standalone.py` и проверяйте его командой `python3 tools/build_standalone.py --check`.
+
+Для открытия главного меню уберите `node`. На существующем сервере `install-cli` обновляет только локальные команды; перед обновлением прочитайте [заметки миграции](MIGRATION.md).
 
 **Для установки ноды** нужен Docker Compose v2 с поддержкой `up --wait`. На чистом сервере установщик проверяет UFW: при необходимости ставит пакет, добавляет разрешение на фактический TCP-порт SSH и только затем включает firewall. Порт `22` не подставляется наугад. Уже активный UFW не перенастраивается на этом этапе, политика deny/reject для входящих соединений обязательна. Держите открытыми текущую SSH-сессию и консоль VPS, пока не проверите вход второй сессией.
 
@@ -105,18 +112,11 @@ sudo bash ./safe-remnanode-setup.sh node  # сразу запустить уст
 
 Для трёх транспортов на одной ноде активируйте три inbound в **одном Config Profile** панели. Установщик не редактирует профиль. Для действующего деплоя используйте `node-transports` без пересоздания контейнеров; `node-check-ports` диагностирует слушатели. См. [порядок миграции](MIGRATION.md#три-транспорта-на-одной-ноде-10).
 
-## 🧩 Модуль C — Защита RKN-Watcher
+## 🧩 Модуль C — RKN Watcher 3.2.1
 
-- **TSPUBLOCK** — список CIDR ТСПУ (`CyberOK_Skipa_ips`)
-- **GOVIPS** — список сетей госструктур (`C24Be/AS_Network_List`)
-- Блокировка `iptables` + `ipset` (hash:net до 2 млн записей), **атомарное обновление** через временный set + swap
-- **GeoIP**: allow-страны (ipdeny с кэшем 24ч), allow/deny IP/CIDR, allow/deny порты, фильтрация по `FILTER_PORTS`
-- Логирование RST-пакетов (опционально)
-- **systemd timer** — ежедневное обновление в 03:00 с задержкой до 20 минут + boot-сервис восстановления после перезагрузки
-- file-lock на JSON-конфигурацию (fcntl)
-- Манифест установленных пакетов — при удалении предлагается снять и их
+Встроен проверенный комплект из [`3c88c27a6518`](https://github.com/Balbuto/RKN-Watcher/tree/3c88c27a65181a93921a21b2d8a28f2292df1e03): штатный установщик, 8 shell-модулей и Python-хелперы. `protect` берёт код из текущего локального файла, не скачивая исполняемый код из `main`. Сами списки обновляются по сети, как и раньше.
 
-Python-хелперы `config_tool.py` и `geoip_apply.py` **встроены в скрипт** и распаковываются в `/opt/rkn-watcher/` — единый файл, ничего дополнительно качать не нужно.
+В 3.2.1 доступны IPv6 для списков разрешённых и запрещённых IP/CIDR, выбор бэкенда netfilter (`auto`, `nft`, `legacy`), проверка nftables, `doctor`, `metrics` и снимки состояния. `protect-update` обновляет списки, **а не версию программы**. Перед обновлением действующего Watcher см. [миграцию](MIGRATION.md#rkn-watcher-321-14).
 
 ## 🧩 Модуль D — Мульти-тесты
 
@@ -151,6 +151,7 @@ sudo safe-remnanode-setup protect-menu       # меню защиты
 sudo safe-remnanode-setup protect-update     # обновить блок-листы
 sudo safe-remnanode-setup protect-apply      # переприменить правила
 sudo safe-remnanode-setup protect-status     # статус защиты
+safe-remnanode-setup protect-version        # версия встроенного комплекта
 sudo safe-remnanode-setup protect-uninstall  # удалить защиту
 sudo safe-remnanode-setup multitest          # мульти-тесты
 sudo safe-remnanode-setup ipv6               # управление IPv6
@@ -167,26 +168,39 @@ sudo safe-remnanode-setup ipv6               # управление IPv6
 - Compose проверяется перед заменой конфигов; при неудачном запуске скрипт пытается вернуть предыдущие файлы и применить их
 - Добавляется отдельное правило для IP панели. Уже открытые администратором или оставшиеся от предыдущих версий разрешения нужно проверить вручную.
 - При удалении ноды UFW не очищается: оставшиеся правила проверьте и снимите вручную.
-- Проверка поддержки ipset ядром перед установкой защиты
-- CI (GitHub Actions): ShellCheck, bash -n, проверка Python-хелперов и `tests/smoke.sh` с заглушками при каждом push/PR
+- RKN Watcher проверяет доступность nftables; тестируйте правила и совместимость бэкенда с UFW на отдельной ноде.
+- CI (GitHub Actions): проверка свежести однофайловой сборки, bash -n, ShellCheck и smoke-тесты для standalone и модульного входов при каждом push/PR
 
-## 📁 Структура репозитория
+## 🧱 Модульная архитектура
 
+```text
+safe-remnanode-setup.sh          # однофайловый релиз для wget и установки CLI
+safe-remnanode-setup-modular.sh  # загрузчик исходников для разработки и проверок
+lib/
+  modules.list                   # порядок загрузки и сборки
+  common.sh, cli.sh, server.sh
+  node.sh, firewall.sh, tls.sh, compose.sh, xray.sh, web.sh, diagnostics.sh
+  rkn.sh                         # наша обёртка для RKN Watcher
+vendor/rkn-watcher/              # исходники закреплённого RKN 3.2.1 и его лицензия
+tools/build_standalone.py         # воспроизводимая однофайловая сборка
 ```
-safe-remnanode-setup/
-├── safe-remnanode-setup.sh      # универсальный скрипт (всё в одном файле)
-├── README.md                    # документация
-├── USER_GUIDE.md                # подробное руководство пользователя
-└── .github/workflows/ci.yml     # CI: shellcheck + bash -n + py_compile
+
+Редактируйте `lib/`, а не сгенерированный файл. Чтобы собрать релиз и проверить, что файл не устарел:
+
+```bash
+python3 tools/build_standalone.py
+python3 tools/build_standalone.py --check
+bash tests/smoke.sh
+REMNA_ENTRYPOINT=./safe-remnanode-setup-modular.sh bash tests/smoke.sh
 ```
 
+Модульный запуск: `bash ./safe-remnanode-setup-modular.sh --help`. Он рассчитан на полный каталог исходников. При регистрации глобальной команды оба варианта устанавливают однофайловый скрипт: на сервер не нужно переносить `lib/` или `vendor/`. Сборка не требует сети, код RKN Watcher берётся из `vendor/rkn-watcher/`.
 
 ## ⚠️ Примечания
 
-- Защита RKN-Watcher работает только с **IPv4** (ipset family inet)
+- Поддержка IPv6 зависит от доступности `ip6tables` и `ipset` на хосте; не все внешние источники содержат IPv6.
 - GeoIP-страны качаются с ipdeny.com; TSPUBLOCK/GOVIPS — с GitHub
-- При отсутствии поддержки ipset в ядре (нет модуля `xt_set`) установщик предупредит и предложит остановиться
-- Модуль защиты совместим с UFW (цепочки вставляются в INPUT поверх правил UFW)
+- RKN Watcher добавляет собственные цепочки INPUT. Проверяйте правила UFW и доступ SSH отдельной сессией после установки защиты.
 
 ## 📜 Лицензия
 
