@@ -8,61 +8,29 @@ on:
 
 jobs:
   lint:
-    name: Lint & Syntax (shellcheck + bash -n + py_compile)
+    name: Verify sources, standalone build and both entry points
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Debug — list files
-        run: |
-          echo "--- содержимое репозитория ---"
-          ls -la
-          echo "--- tests/ ---"
-          ls -la tests/ 2>/dev/null || echo "(каталога tests/ нет — не критично, проверка хелперов встроена в CI)"
-
-      - name: Install shellcheck
+      - name: Install ShellCheck and jq
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq shellcheck
+          sudo apt-get install -y -qq shellcheck jq
 
-      - name: bash -n (syntax check)
-        run: bash -n safe-remnanode-setup.sh
+      - name: Verify committed standalone build and vendored checksums
+        run: python3 tools/build_standalone.py --check
 
-      - name: ShellCheck
-        run: shellcheck safe-remnanode-setup.sh
-
-      # Проверка встроенных Python-хелперов (heredoc-блоки RKN_PY_CFGTOOL / RKN_PY_GEOIP).
-      # Выполняется инлайн, чтобы CI не зависел от наличия tests/check_embedded_python.py
-      # (этот файл остаётся удобным локальным инструментом и дублирует логику).
-      - name: Embedded Python helpers (py_compile)
+      - name: Bash syntax and ShellCheck
         run: |
-          python3 - <<'PY'
-          import pathlib, py_compile, re, tempfile
+          for file in safe-remnanode-setup*.sh lib/*.sh tests/smoke.sh; do bash -n "$file"; done
+          shellcheck -x safe-remnanode-setup*.sh tests/smoke.sh
 
-          script = pathlib.Path("safe-remnanode-setup.sh")
-          if not script.is_file():
-              raise SystemExit(f"FAIL: {script} не найден в корне репозитория")
+      - name: Smoke tests — standalone
+        run: bash tests/smoke.sh
 
-          source = script.read_text(encoding="utf-8")
-          failed = False
-
-          with tempfile.TemporaryDirectory(prefix="ci-pyc-") as tmp_dir:
-              for marker, filename in (("RKN_PY_CFGTOOL", "config_tool.py"),
-                                       ("RKN_PY_GEOIP", "geoip_apply.py")):
-                  match = re.search(r"<<'" + marker + r"'\n(.*?)\n" + marker, source, re.S)
-                  if not match:
-                      print(f"FAIL: heredoc-блок '{marker}' не найден")
-                      failed = True
-                      continue
-                  path = pathlib.Path(tmp_dir) / filename
-                  path.write_text(match.group(1), encoding="utf-8")
-                  try:
-                      py_compile.compile(str(path), doraise=True)
-                      print(f"OK: {filename}")
-                  except py_compile.PyCompileError as exc:
-                      print(f"FAIL: {filename}: {exc}")
-                      failed = True
-
-          raise SystemExit(1 if failed else 0)
-          PY
+      - name: Smoke tests — modular sources
+        env:
+          REMNA_ENTRYPOINT: ./safe-remnanode-setup-modular.sh
+        run: bash tests/smoke.sh
